@@ -31,7 +31,32 @@ A minimal, fast, frameless browser — *just a centered pill and the web*. Built
 
 ---
 
-## 🚀 Quick Start
+## 📥 Install (any arch, any distro — curl handles deps)
+
+**One-liner (detects `x86_64`/`aarch64` + `apt`/`dnf`/`pacman`/`zypper`, installs `webkit2gtk-4.1` etc.):**
+```sh
+curl -fsSL https://raw.githubusercontent.com/sahilcodexx/zebBrowser/main/install.sh | bash
+# → installs deb on Ubuntu/Debian, rpm on Fedora, AppImage fallback on others
+# then run: zeb  or  ~/.local/bin/zeb
+```
+
+**Arch AUR:**
+```sh
+# PKGBUILD is in repo root — publish to AUR or build locally:
+makepkg -si  # or  yay -S zeb-browser / paru -S zeb-browser  (once AUR published)
+# or
+sudo pacman -U zeb-browser-*.pkg.tar.zst
+```
+
+**Manual (AppImage universal):**
+```sh
+# from GitHub Releases → zeb_0.1.0_amd64.AppImage
+chmod +x zeb_*_amd64.AppImage && ./zeb_*_amd64.AppImage
+```
+
+---
+
+## 🚀 Quick Start (dev)
 
 ```sh
 # clone
