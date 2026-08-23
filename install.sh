@@ -83,13 +83,14 @@ DESKTOP
 
 if [ "$VERSION" = "latest" ]; then
   info "Resolving latest release..."
-  LATEST_URL=$(curl -fsSL -o /dev/null -w "%{url_effective}" "https://github.com/$REPO/releases/latest" 2>/dev/null || true)
-  TAG=""
-  if [ -n "$LATEST_URL" ] && echo "$LATEST_URL" | grep -q "/tag/"; then
-    TAG=$(basename "$LATEST_URL")
-  else
-    API_RESP=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
-    TAG=$(echo "$API_RESP" | grep '"tag_name"' | cut -d'"' -f4 || true)
+  # prefer API (not CDN-cached) — handles just-published releases
+  API_RESP=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+  TAG=$(echo "$API_RESP" | grep '"tag_name"' | cut -d'"' -f4 || true)
+  if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+    LATEST_URL=$(curl -fsSL -o /dev/null -w "%{url_effective}" "https://github.com/$REPO/releases/latest" 2>/dev/null || true)
+    if [ -n "$LATEST_URL" ] && echo "$LATEST_URL" | grep -q "/tag/"; then
+      TAG=$(basename "$LATEST_URL")
+    fi
   fi
   if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
     echo ""
