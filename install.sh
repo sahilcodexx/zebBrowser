@@ -87,7 +87,7 @@ if [ "$VERSION" = "latest" ]; then
   info "Latest: $VERSION"
 fi
 # strip v
-VER_NUM=${VERSION#v}
+VER_NUM=${VERSION#zeb-v}; VER_NUM=${VER_NUM#v}
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
