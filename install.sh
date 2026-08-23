@@ -57,10 +57,13 @@ install_appimage() {
   mv "$file" "$HOME/.local/bin/zeb.AppImage"
   cat > "$HOME/.local/bin/zeb" <<'WRAPPER'
 #!/usr/bin/env bash
-# Wayland/Hyprland fix: AppImage WebKit needs X11 backend on some compositors
+# Hyprland/Wayland EGL fix — try X11 via XWayland, fall back to software
 export GDK_BACKEND=x11
+export WAYLAND_DISPLAY=""
 export WEBKIT_DISABLE_COMPOSITING_MODE=1
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export LIBGL_ALWAYS_SOFTWARE=1
+export EGL_PLATFORM=x11
 exec "$HOME/.local/bin/zeb.AppImage" "$@"
 WRAPPER
   chmod +x "$HOME/.local/bin/zeb"
