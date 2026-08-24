@@ -6,8 +6,25 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+/// WebKitGTK's DMA-BUF renderer fails inside AppImages on Wayland compositors
+/// (Hyprland, NVIDIA, some Intel Mesa) with:
+/// `Could not create default EGL display: EGL_BAD_PARAMETER` and a blank window.
+/// Must run before gtk/webkit init.
+#[cfg(target_os = "linux")]
+fn disable_webkit_dmabuf() {
+    #[allow(unused_unsafe)]
+    unsafe {
+        if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    disable_webkit_dmabuf();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
