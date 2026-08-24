@@ -70,6 +70,12 @@ for lib in /usr/lib/libwayland-client.so.0 /usr/lib/x86_64-linux-gnu/libwayland-
   fi
 done
 
+# Performance hints (both default to "off" / safe):
+#   ZEB_HARDWARE_ACCEL=1            re-enable DMA-BUF / GPU render — fastest, but
+#                                   can crash on broken Wayland / Mesa stacks.
+#   ZEB_DISABLE_CONTENT_BLOCKER=1   turn off the built-in tracker / ad blocker.
+# Example:  ZEB_HARDWARE_ACCEL=1 zeb
+
 exec "$HOME/.local/bin/zeb.AppImage" "$@"
 WRAPPER
   chmod +x "$HOME/.local/bin/zeb"

@@ -108,6 +108,32 @@ Traditional web browsers are cluttered with tabs, complex menus, extensions side
   Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36
   ```
 
+### Problem 7: Heavy Sites (e.g. Vercel Portfolios) Freeze The Webview
+* **Issue**: Opening a heavy site — many React components, several third-party analytics / ad scripts, lots of DOM — made the whole webview peg CPU and become unresponsive. The root cause was the side effect of Problem 3's DMA-BUF workaround: with `WEBKIT_DISABLE_DMABUF_RENDERER=1` forced, WebKitGTK falls back to a software render pipeline, which is dramatically slower for any non-trivial page. The secondary cause was the cost of running analytics / ad scripts in parallel to the React tree (Vercel Analytics, Sentry, Hotjar, etc.).
+* **Solution**:
+  1. **Make hardware acceleration opt-in**, not forced. `apply_webkit_env()` in `src-tauri/src/lib.rs` now reads `ZEB_HARDWARE_ACCEL=1` and only forces `WEBKIT_DISABLE_DMABUF_RENDERER=1` when the user has *not* opted in. The safe software path stays the default so the original EGL crash fix is preserved.
+  2. **Lightweight JS content blocker** injected at document-start. A small IIFE overrides `fetch`, `XMLHttpRequest`, `sendBeacon` and a `MutationObserver` to short-circuit requests to a curated list of tracker / ad domains (Google Analytics, Vercel Analytics, Sentry, Hotjar, FullStory, LogRocket, Mixpanel, Segment, Amplitude, Heap, Datadog, Intercom, Zendesk, Tawk.to, Plausible, Umami, Cloudflare Insights, Yandex, Quantcast, Comscore, ad exchanges, etc.). Skips `localhost` and `tauri://` pages.
+  3. **Opt-out flag**: `ZEB_DISABLE_CONTENT_BLOCKER=1` sets `window.__ZEB_NO_BLOCK__ = true` and the blocker bails out — useful when a site legitimately depends on one of the blocked SDKs.
+  4. **Disk cache hint**: `WEBKIT_CACHE_DIR` is set to `$XDG_CACHE_HOME/zeb` so repeat visits to the heavy portfolio skip the network entirely.
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ZEB_HARDWARE_ACCEL=1` | off | Re-enable DMA-BUF / GPU rendering on systems that don't suffer the Wayland EGL crash. Largest single perf win. |
+| `ZEB_DISABLE_CONTENT_BLOCKER=1` | off | Disable the JS tracker / ad blocker if a site breaks. |
+| `ZEB_LITE=1` | off | Enable **Lite Mode** on every external page (see Problem 8). The "feels smooth" switch. |
+| `WEBKIT_DISABLE_DMABUF_RENDERER=1` | forced | Legacy env var. If `ZEB_HARDWARE_ACCEL=1` is set, this is left untouched (so the user can still force the old behavior). |
+
+### Problem 8: Lite Mode — making heavy sites *feel* smooth
+* **Issue**: Even with the content blocker off the critical path, a React + Framer-Motion / GSAP portfolio still janks while scrolling: every animation paints every frame on the software render path, every <img> decodes synchronously on first paint, and any `WebGL` context adds multi-hundred-ms of GPU init. The site is *correct*, but the experience is "laggy".
+* **Solution**: A new `LITE_MODE` constant is appended to the inject script (gated on `__ZEB_LITE__`, set from `ZEB_LITE=1`). On every non-local page it:
+  1. Inserts a `!important` stylesheet that clamps every `animation-*` / `transition-*` duration to 0.001ms and forces `scroll-behavior: auto`. Single biggest jank-killer.
+  2. Walks every <img> (now and via MutationObserver) setting `loading="lazy"` and `decoding="async"` so the browser only decodes what's actually on-screen.
+  3. Wraps `HTMLCanvasElement.prototype.getContext` to return `null` for `webgl` / `webgl2` / `experimental-webgl`. Most portfolios don't need them.
+  4. Tags `<html>` with `zeb-lite` so the user can target it from DevTools or their own CSS.
+* **UX surface**: a small `?` chip in the bottom-left of the spotlight screen opens a modal (`get_perf_settings` Tauri command) that reads the current env-var state and shows what each toggle does, plus the env var name to set. No runtime mutation — env vars are process-level — so the modal is honest about restart-required.
+
 ---
 
 ## 4. File & Directory Structure
