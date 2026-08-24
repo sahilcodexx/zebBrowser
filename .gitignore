@@ -21,4 +21,10 @@ dist-ssr
 *.ntvs*
 *.njsproj
 *.sln
-*.sw?
+# Tauri & Cargo
+src-tauri/target
+cargo-home
+srcdir
+pkg
+*.pkg.tar*
+squashfs-root
