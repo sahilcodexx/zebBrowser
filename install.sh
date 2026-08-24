@@ -70,7 +70,6 @@ for lib in /usr/lib/libwayland-client.so.0 /usr/lib/x86_64-linux-gnu/libwayland-
   fi
 done
 
-export WEBKIT_DISABLE_DMABUF_RENDERER="${WEBKIT_DISABLE_DMABUF_RENDERER:-1}"
 exec "$HOME/.local/bin/zeb.AppImage" "$@"
 WRAPPER
   chmod +x "$HOME/.local/bin/zeb"
