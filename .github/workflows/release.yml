@@ -1,42 +1,69 @@
 name: release
+
 on:
   push:
     tags:
       - "v*"
+      - "zeb-v*"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  release:
-    permissions:
-      contents: write
+  build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - name: setup pnpm
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
-      - name: setup node
+          version: 10
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
-      - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: install dependencies
+
+      - name: Install system deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - name: install frontend dependencies
-        run: pnpm install
-      - uses: tauri-apps/tauri-action@v0
+          sudo apt-get update -y
+          sudo apt-get install -y libfuse2 file
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          # pnpm allowBuilds needs explicit approval, ensure electron postinstall runs
+          CI: true
+
+      - name: Build AppImage
+        run: pnpm exec electron-builder --linux AppImage --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List dist
+        run: ls -lh dist/ || ls -lh .
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppImage
+          path: |
+            dist/*.AppImage
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.AppImage
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: zeb-v__VERSION__
-          releaseName: "zeb v__VERSION__"
-          releaseBody: "See the assets to download this version and install."
-          releaseDraft: false
-          prerelease: false

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Mini Browser
+Comment=Minimal Electron browser — floating Zen pill, no tabs/history/bookmarks
+Exec=mini-browser %U
+Exec=mini %U
+Icon=mini-browser
+Terminal=false
+Type=Application
+Categories=Network;WebBrowser;
+StartupWMClass=mini-browser
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;

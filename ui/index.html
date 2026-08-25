@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mini Browser</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="hover-trigger" aria-hidden="true"></div>
+
+  <div id="toolbar" role="toolbar" aria-label="Browser toolbar">
+    <button id="homeBtn" title="Home" aria-label="Home">⌂</button>
+    <button id="back" title="Back (Alt+←)" aria-label="Back">←</button>
+    <button id="forward" title="Forward (Alt+→)" aria-label="Forward">→</button>
+    <button id="reload" title="Reload (Ctrl+R / F5)" aria-label="Reload">↻</button>
+
+    <div id="address-wrap">
+      <span id="lock" aria-hidden="true">🔍</span>
+      <input id="address" type="text" placeholder="Search or enter URL (Ctrl+L)" spellcheck="false" autocomplete="off" />
+      <span id="loading" class="hidden" aria-hidden="true"></span>
+    </div>
+
+    <button id="stop" class="hidden" title="Stop (Esc)">✕</button>
+  </div>
+
+  <div id="home">
+    <div id="home-inner">
+      <h1>Mini Browser</h1>
+      <p>Chromium engine — no tabs, no bookmarks, no history. Zen hover bar.</p>
+      <div id="sites"></div>
+      <div id="hint">
+        <span>Hover top</span> show bar &nbsp;·&nbsp; <span>Ctrl+L</span> focus &nbsp;·&nbsp; <span>Enter</span> go &nbsp;·&nbsp; <span>⌂</span> home &nbsp;·&nbsp; <span>Alt+←/→</span> back/forward
+      </div>
+    </div>
+  </div>
+
+  <script src="./renderer.js"></script>
+</body>
+</html>
