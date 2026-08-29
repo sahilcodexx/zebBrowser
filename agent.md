@@ -10,7 +10,7 @@ Mini Browser is a **minimal Chromium shell** for personal use on low-spec Linux 
 ```
 helium/Chromium engine KEEP (Blink, V8, GPU, networking, Web APIs, sandbox, multiprocess)
 browser UI REMOVE (tabs, bookmarks, history, sync, onboarding, sidebar, menus)
-your minimal UI ADD (search bar + 10-15 shortcuts)
+your minimal UI ADD (single search bar — no link grid, no toolbar)
 ```
 Achieved via **Electron**: `BrowserWindow (toolbar) + WebContentsView (website)`.
 
@@ -33,9 +33,12 @@ mini/ (repo root, was helium-linux)
 ├── pnpm-workspace.yaml  # allowBuilds: electron: true  (required for pnpm)
 ├── pnpm-lock.yaml
 ├── ui/
-│   ├── index.html       # toolbar (floating pill) + home grid
-│   ├── style.css        # Zen hover pill + home grid
-│   └── renderer.js      # toolbar-only logic, no navigation
+│   ├── index.html       # home: centered search input
+│   ├── style.css        # home pill styles
+│   ├── renderer.js      # home show/hide, navigation, Ctrl+K → request palette
+│   ├── palette.html     # command palette UI (loaded into its own WebContentsView)
+│   ├── palette.css      # command palette styles (backdrop, card, items, footer)
+│   └── palette.js       # palette show/close/filter, executes actions via main
 └── agent.md / README.md
 ```
 
@@ -45,43 +48,45 @@ No `mini-browser/` subfolder anymore — contents were flattened to root (see im
 
 ### `main.js:1` — Main Process (navigation lives here)
 
-- `SITES:5` — array of 15 `{label, url}`. Edit here to change home shortcuts, no UI touch.
-- `SEARCH_ENGINE:23` — `https://www.google.com/search?q=`
-- `viewVisible:25` — controls whether `WebContentsView` is shown. `TOOLBAR_HEIGHT=0` — view is full-window, toolbar floats over it.
-- `isUrl():30` / `toUrl():38` — URL vs search detection (http, localhost, domain vs query).
-- `updateViewBounds():47` — if `!viewVisible` → `0x0`, else full `getContentBounds()`. Called on `resize`.
-- `showView():57` / `hideView():62` — toggle `viewVisible`, send `view-visibility` to renderer, `hideView` also `loadURL('about:blank')`.
-- `createWindow():70` — `BrowserWindow` (1280x800, `hiddenInset`, `autoHideMenuBar`) loads `ui/index.html`; `WebContentsView` added as child, initially `hideView()`.
-- IPC + `did-navigate:115` auto-`showView()` when URL != `about:blank`, sync URL/loading to toolbar.
-- `handleShortcut():137` — `Ctrl/Cmd+L` → `win.focus()` + `focus-address-bar`, `Ctrl+R/F5` reload, `Ctrl+Shift+I` DevTools, `Alt+←/→` back/forward, `Esc` stop. Both `win` and `view` listen via `before-input-event:181` with `event.preventDefault()`.
-- IPC handlers `193` — `get-sites`, `get-current-url`, `navigate` (calls `showView`+`loadURL`), `go-home`→`hideView`, `go-back` (or `hideView` if no history), etc.
+- `SEARCH_ENGINE:4` — `https://www.google.com/search?q=`
+- `viewVisible:5` — controls whether the **site** `WebContentsView` is shown. View is full-window on a site, `0x0` on home.
+- `isUrl():10` / `toUrl():18` — URL vs search detection (http, localhost, domain vs query).
+- `updateViewBounds():27` — if `!viewVisible` → `0x0`, else full `getContentBounds()`. Called on `resize`.
+- `showView():37` / `hideView():43` — toggle `viewVisible`, send `view-visibility` to home, `hideView` also `loadURL('about:blank')`.
+- `showPalette():54` / `hidePalette():61` — palette view bounds: `0x0` when closed, full window when open. `hidePalette` restores focus to the view (if a site is showing) or the home page.
+- `createWindow():69` — `BrowserWindow` (1280x800, `hiddenInset`, `autoHideMenuBar`) loads `ui/index.html`; then `view` (site) and `paletteView` (palette) are added as children of `win.contentView` in that order, so the palette renders on top.
+- `did-navigate:122` auto-`showView()` when URL != `about:blank`, sync URL via `url-changed`.
+- `handleShortcut():154` — `Ctrl/Cmd+L` → `win.focus()` + `focus-address-bar`, `Ctrl/Cmd+K` → `win.focus()` + `showPalette()`, `Ctrl+R/F5` reload, `Ctrl+Shift+I` DevTools, `Alt+←/→` back/forward, `Esc` stop. Only the **view** listens via `before-input-event` so the win/palette can own `Esc`/`↑`/`↓`/`Enter`/`Ctrl+K`.
+- IPC handlers — `navigate` (calls `showView`+`loadURL`), `go-home`→`hideView`, `go-back` (or `hideView` if no history), `go-forward`/`reload`/`stop`/`focus-view`; `show-palette-request` from home; `palette-close` and `palette-action` from the palette view (`{type: 'go-home'|'go-back'|'go-forward'|'reload'|'navigate', query?}`).
 
 ### `preload.js:1` — Bridge (isolated)
 
-Exposes `window.electronAPI` via `contextBridge`. Only `invoke`/`send`/`on` wrappers. No direct `ipcRenderer` exposure. New APIs: `goHome`, `onViewVisibility`, `onShowToolbar`.
+Exposes `window.electronAPI` via `contextBridge`. Only `invoke`/`send`/`on` wrappers. No direct `ipcRenderer` exposure. Surface (used by both home and palette webContents):
+- Navigation: `navigate`, `goBack`, `goForward`, `reload`, `stop`, `goHome`, `focusView`.
+- Home events: `onFocusAddressBar`, `onUrlChanged`, `onViewVisibility`.
+- Palette plumbing: `requestShowPalette` (home → main), `onPaletteShow` (main → palette), `paletteAction` (palette → main), `closePalette` (palette → main).
 
-### `ui/index.html:1`
+### `ui/index.html` and `ui/style.css` — home
 
-- `#hover-trigger:10` — 14px transparent zone at top, triggers pill.
-- `#toolbar:12` — floating pill with `homeBtn`, `back`, `forward`, `reload`, `address-wrap` (🔍 + input + loading), `stop`. Fixed, centered.
-- `#home:27` — centered grid, `h1`, `p`, `#sites`, `#hint`.
+- `#home` — full-bleed centered container, hidden (`.hidden`) while a site is showing.
+- `#search-form` — single inline form with a search SVG icon and the `#search` text input. 48px white pill with `border-radius:999px`, soft shadow; `:focus` swaps to a darker border and a stronger shadow.
 
-### `ui/style.css:1`
+### `ui/renderer.js` — home
 
-- `#hover-trigger:6` — fixed top 0 height 14px.
-- `#toolbar:12` — fixed `top:10px left:50% transform: translateX(-50%)`, `width: min(640px,62%) height:36px`, `border-radius:999px`, `backdrop-filter: blur(12px)`, `opacity:0` + `translateY(-16px)` hidden, visible when `.visible` or `#hover-trigger:hover + #toolbar` or `:hover` or `:focus-within` → `opacity:1 translateY(0)`.
-- Buttons `26x26`, `address-wrap 26px`, thin pill. `#home` is `flex:1` grid centered, `max-width:720px`, site grid `repeat(auto-fill, minmax(140px,1fr))`.
+- `viewHasContent:10` — mirrors `viewVisible` from main.
+- `showHome(show):12` — toggles `home.hidden`, sets `viewHasContent`, and on show schedules `search.focus()` + `select()` (10ms delay for Wayland focus).
+- `navigate(value):21` → `electronAPI.navigate`, `showHome(false)`, `focusView` (80ms).
+- `goHome():29` → clear search, `showHome(true)`, `goHome` IPC.
+- `onFocusAddressBar:41` (from main on Ctrl/Cmd+L) → if a site is showing, `goHome()`; else just refocus + select.
+- `Ctrl/Cmd+K` on home → `electronAPI.requestShowPalette()`.
+- `onViewVisibility:60` syncs from main; `onUrlChanged:50` mirrors current URL into `viewHasContent`.
 
-### `ui/renderer.js:1`
+### `ui/palette.html`, `ui/palette.css`, `ui/palette.js` — command palette
 
-- `viewHasContent:14` — mirrors `viewVisible` from main.
-- `showHome(show):23` — toggles `home.hidden` and toolbar `.visible`; home→ pinned visible, site→ auto-hide.
-- `navigate(value):35` → `electronAPI.navigate`, `showHome(false)`, `focusView`.
-- `goHome():43` → clear input, `showHome(true)`, `goHome()` IPC.
-- Toolbar btn handlers, `address` Enter→navigate, Esc→blur+hide or close, Ctrl+L→select.
-- Hover `85` keeps pill visible, `mouseleave` hides if not focused.
-- `onFocusAddressBar:93` — **does not toggle home**, just `toolbar.visible` + `address.focus()` + `select()` (delay 10ms for Wayland).
-- `onViewVisibility:116` syncs from main, `onUrlChanged`, `onLoadingChanged`, site grid build from `getSites()`.
+- Loaded into its own `WebContentsView` (see main.js). When closed, the view is at `0x0`; when open, full-window on top of the site view.
+- `STATIC_COMMANDS` (Go Home/Back/Forward/Reload) + dynamic `navigate` action when input is non-empty. `getCommands` filters by substring on label+keywords. `renderPalette` groups by `section` and highlights the selected item.
+- `paletteInput` keydown handles `Esc`/`↑`/`↓`/`Enter`/`Ctrl+K`; `paletteResults` click+mousemove; `paletteBackdrop` click sends `closePalette`.
+- `onPaletteShow` (from main) calls `show()`; `paletteAction({type, query?})` triggers the action in main, which closes the palette automatically.
 
 ### `pnpm-workspace.yaml:1`
 
@@ -90,36 +95,48 @@ Exposes `window.electronAPI` via `contextBridge`. Only `invoke`/`send`/`on` wrap
 ## 5. Architecture
 
 ```
-BrowserWindow (win) — loads file:// ui/index.html
-├── #hover-trigger + #toolbar (HTML, renderer.js)
+BrowserWindow (win) — loads file:// ui/index.html (home)
 └── contentView
-    └── WebContentsView (view) — loads https:// sites, full window
+    ├── webContents (root, home: centered search input)
+    ├── WebContentsView (view)         — loads https:// sites, full window when active
+    └── WebContentsView (paletteView)  — loads file:// ui/palette.html, 0x0 when closed
 ```
-Separation: `ui/renderer.js` never touches `webContents` directly, only via IPC to `main.js`. Security: `contextIsolation:true, sandbox:true, nodeIntegration:false` in both.
+The palette view is added **after** the site view, so it renders on top of the site when its bounds are full-window. Closed = `0x0` (invisible). Open = full content bounds (visible above the site).
+
+Separation: `ui/renderer.js` and `ui/palette.js` never touch `webContents` directly, only via IPC to `main.js`. Security: `contextIsolation:true, sandbox:true, nodeIntegration:false` in all three.
 
 ## 6. IPC Contract
 
 | Renderer → Main | Main → Renderer |
 |---|---|
-| `invoke get-sites` | `view-visibility` (bool) |
-| `invoke get-current-url` | `url-changed` (url) |
-| `send navigate` (string) | `loading-changed` (bool) |
-| `send go-back/go-forward/reload/stop/go-home/focus-view` | `focus-address-bar` |
-| `send show-toolbar` | `show-toolbar` |
+| `send navigate` (string) | `view-visibility` (bool) → home |
+| `send go-back/go-forward/reload/stop/go-home/focus-view` | `url-changed` (url) → home |
+| `send show-palette-request` (home) | `focus-address-bar` → home |
+| `send palette-close` (palette) | `palette-show` → palette |
+| `send palette-action` (palette, `{type, query?}`) | |
 
 ## 7. Shortcuts
 
 | Shortcut | Location | Action |
 |---|---|---|
-| `Ctrl/Cmd+L` | `main.js:144` | Focus address bar (floating pill) |
-| `Enter` in address | `renderer.js:43` | `toUrl()` → navigate or search |
-| `Ctrl+R` / `F5` | `main.js:152` | Reload view |
-| `Alt+←` | `main.js:163` | Back (or home if no history) |
-| `Alt+→` | `main.js:168` | Forward |
-| `Esc` (view) | `main.js:173` | Stop loading |
-| `Esc` (address) | `renderer.js:50` | Blur+hide pill, keep site |
-| `⌂` | `renderer.js:51` | Go home (`about:blank` + hide view) |
-| `Ctrl+Shift+I` | `main.js:157` | Toggle DevTools (detach) |
+| `Ctrl/Cmd+L` | `main.js` (view) | Bring window forward + signal home; home goes to search bar |
+| `Ctrl/Cmd+K` | `main.js` (view) / `renderer.js` (home) | Open command palette |
+| Palette `↑` / `↓` | `palette.js` | Move selection |
+| Palette `Enter` | `palette.js` | Send `palette-action` to main → execute + close |
+| Palette `Esc` / `Ctrl+K` | `palette.js` | Send `palette-close` to main |
+| `Enter` in home search | `renderer.js` | Submit → `navigate()` |
+| `Ctrl+R` / `F5` | `main.js` | Reload view |
+| `Alt+←` | `main.js` | Back (or home if no history) |
+| `Alt+→` | `main.js` | Forward |
+| `Esc` (view) | `main.js` | Stop loading |
+| `Esc` (home) | `renderer.js` | If a site is showing, go home |
+| `Ctrl+Shift+I` | `main.js` | Toggle DevTools (detach) |
+
+### Command palette (Ctrl+K)
+
+- Static commands: `Go Home` (⌂), `Go Back` (←), `Go Forward` (→), `Reload Page` (↻).
+- Dynamic action: when the user has typed something, a top "Action" item appears — `Go to "<query>"` if the input looks like a URL (`http(s)://`, `localhost:port`, or `domain.tld`), otherwise `Search for "<query>"`. Selecting it sends `palette-action` to main, which routes through the same `toUrl` / view-load path.
+- Backdrop click, `Esc`, or `Ctrl+K` again sends `palette-close`; main hides the palette view and restores focus to the view (if a site is open) or the home page.
 
 ## 8. Development Workflow
 
@@ -134,7 +151,8 @@ pnpm install
 # 4. if still only locales/zh-CN.pak in dist, manually: unzip ~/.cache/electron/*/electron-*.zip -d node_modules/electron/dist && echo -n electron > node_modules/electron/path.txt
 
 pnpm start   # or npm start (if pnpm slow)
-# hover top 14px → pill appears; Ctrl+L → focus; type URL/search → Enter
+# on launch: centered search input; type URL/search → Enter
+# Ctrl+K (on any site or on home) → command palette; Esc / Ctrl+K / backdrop click to close
 pnpm run build  # electron-builder → AppImage/deb
 ```
 
@@ -142,7 +160,7 @@ pnpm run build  # electron-builder → AppImage/deb
 
 ## 9. Configuration
 
-Edit `main.js:5` `SITES` and `SEARCH_ENGINE:23`. No rebuild needed. Example: add `{label:'Linear', url:'https://linear.app'}`.
+Edit `main.js:4` `SEARCH_ENGINE` to change the default web search. No rebuild needed. The link grid was removed, so add sites back by reintroducing a `SITES` array and a `get-sites` IPC if you ever want shortcuts again.
 
 ## 10. Known Issues & Gotchas
 
