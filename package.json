@@ -1,6 +1,6 @@
 {
   "name": "mini-browser",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Minimal Chromium browser - search bar + shortcuts, no tabs/bookmarks/history",
   "main": "main.js",
   "type": "commonjs",
