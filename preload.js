@@ -1,8 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  getSites: () => ipcRenderer.invoke('get-sites'),
-  getCurrentUrl: () => ipcRenderer.invoke('get-current-url'),
+  // navigation (used by home and by main directly)
   navigate: (input) => ipcRenderer.send('navigate', input),
   goBack: () => ipcRenderer.send('go-back'),
   goForward: () => ipcRenderer.send('go-forward'),
@@ -10,10 +9,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stop: () => ipcRenderer.send('stop'),
   goHome: () => ipcRenderer.send('go-home'),
   focusView: () => ipcRenderer.send('focus-view'),
-  showToolbar: () => ipcRenderer.send('show-toolbar'),
+
+  // events for the home page
   onFocusAddressBar: (cb) => ipcRenderer.on('focus-address-bar', cb),
   onUrlChanged: (cb) => ipcRenderer.on('url-changed', (_, url) => cb(url)),
-  onLoadingChanged: (cb) => ipcRenderer.on('loading-changed', (_, v) => cb(v)),
   onViewVisibility: (cb) => ipcRenderer.on('view-visibility', (_, v) => cb(v)),
-  onShowToolbar: (cb) => ipcRenderer.on('show-toolbar', cb),
+
+  // home page requests the command palette (Ctrl+K from home)
+  requestShowPalette: () => ipcRenderer.send('show-palette-request'),
+
+  // command palette: shown by main, executes actions and closes
+  onPaletteShow: (cb) => ipcRenderer.on('palette-show', cb),
+  onPaletteHide: (cb) => ipcRenderer.on('palette-hide', cb),
+  paletteAction: (action) => ipcRenderer.send('palette-action', action),
+  closePalette: () => ipcRenderer.send('palette-close'),
 });
