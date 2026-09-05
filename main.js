@@ -10,12 +10,16 @@ let win;
 let view;       // site view (full-window when active)
 let paletteView; // command palette view (full-window on top of `view` when open)
 
-// --- ad blocker ---
-const ADBLOCKER_LIST_PATH = path.join(__dirname, 'adblocker', 'lists', 'default.txt');
-const ADBLOCKER_UPDATE_URL = 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts';
+// --- ad blocker (uBlock Origin-compatible engine via @ghostery/adblocker) ---
+const { FiltersEngine, Request } = require('@ghostery/adblocker');
+const ADBLOCKER_LIST_URLS = [
+  'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt',
+  'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt',
+];
 let adBlockerEnabled = true;
 let blockedCount = 0;
-let adDomains = new Set();
+let adEngine = null;        // FiltersEngine instance
+let adEngineReady = false;  // true once init/update completes
 let lastAdblockerBroadcast = 0;
 
 function isUrl(text) {
@@ -60,43 +64,7 @@ function hideView() {
 
 // ---------- ad blocker ----------
 
-// Parse a list of domains. Accepts either bare domains (one per line) or
-// hosts format ("127.0.0.1 domain.com" / "0.0.0.0 domain.com"). Skips
-// comments, blank lines, and obviously-not-host entries.
-function loadAdListFromText(text) {
-  const domains = new Set();
-  for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const parts = line.split(/\s+/);
-    const candidate = parts[parts.length - 1].toLowerCase();
-    if (!candidate) continue;
-    if (candidate === 'localhost') continue;
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(candidate)) continue; // bare IP
-    if (!/^[a-z0-9.-]+$/.test(candidate)) continue;
-    if (!candidate.includes('.')) continue;
-    domains.add(candidate);
-  }
-  return domains;
-}
-
-function loadAdList() {
-  // Prefer a user-saved list (after an Update), fall back to the bundled one.
-  const userListPath = path.join(app.getPath('userData'), 'adblocker-list.txt');
-  try {
-    const text = fs.readFileSync(userListPath, 'utf8');
-    adDomains = loadAdListFromText(text);
-    return;
-  } catch {}
-  try {
-    const text = fs.readFileSync(ADBLOCKER_LIST_PATH, 'utf8');
-    adDomains = loadAdListFromText(text);
-  } catch (err) {
-    console.error('Failed to load ad list:', err);
-    adDomains = new Set();
-  }
-}
-
+// Config persistence: adBlockerEnabled (on/off) lives in userData/config.json.
 function loadAdblockerConfig() {
   const configPath = path.join(app.getPath('userData'), 'config.json');
   try {
@@ -116,25 +84,10 @@ function saveAdblockerConfig() {
   }
 }
 
-function isAdUrl(url) {
-  if (!adBlockerEnabled) return false;
-  let hostname;
-  try {
-    hostname = new URL(url).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  // Walk parent domains: cdn.example.com -> example.com -> com (skip com)
-  const parts = hostname.split('.');
-  for (let i = 0; i < parts.length - 1; i++) {
-    const domain = parts.slice(i).join('.');
-    if (adDomains.has(domain)) return true;
-  }
-  return false;
-}
-
+// Broadcast {enabled, blockedCount} to the home and palette webContents,
+// throttled to <=1/400ms so a busy page with many blocked requests does
+// not flood the renderer.
 function sendAdblockerUpdate() {
-  // Throttle to at most one update per 400ms to avoid spamming the renderer
   const now = Date.now();
   if (blockedCount > 1 && now - lastAdblockerBroadcast < 400) return;
   lastAdblockerBroadcast = now;
@@ -147,15 +100,108 @@ function sendAdblockerUpdate() {
   send(paletteView && paletteView.webContents);
 }
 
+function adEngineCachePath() {
+  return path.join(app.getPath('userData'), 'adblocker-engine.bin');
+}
+
+// Persist the engine to disk so subsequent startups skip list parsing.
+function persistAdEngine() {
+  if (!adEngine) return;
+  try {
+    const buf = Buffer.from(adEngine.serialize());
+    fs.writeFileSync(adEngineCachePath(), buf);
+  } catch (err) {
+    console.error('Failed to persist ad blocker engine:', err);
+  }
+}
+
+// Load the engine. Tries the on-disk cache first, then falls back to the
+// bundled prebuilt engine (ads + tracking, no network). Both are uBO-
+// compatible filter lists maintained by the @ghostery/adblocker project.
+async function initAdEngine() {
+  // 1) Disk cache (fastest, no network)
+  try {
+    const buf = fs.readFileSync(adEngineCachePath());
+    adEngine = FiltersEngine.deserialize(new Uint8Array(buf));
+    adEngineReady = true;
+    return;
+  } catch {}
+
+  // 2) Prebuilt engine (bundled, no network)
+  try {
+    adEngine = await FiltersEngine.fromPrebuiltAdsAndTracking();
+    adEngineReady = true;
+    persistAdEngine();
+  } catch (err) {
+    console.error('Failed to initialize ad blocker engine:', err);
+    adEngine = null;
+  }
+}
+
+// Fetch the latest uBO filter lists and rebuild the engine. Used by the
+// "Update Ad Blocker List" palette command.
+async function updateAdEngineFromLists() {
+  try {
+    adEngine = await FiltersEngine.fromLists(fetch, ADBLOCKER_LIST_URLS);
+    adEngineReady = true;
+    blockedCount = 0;
+    persistAdEngine();
+    sendAdblockerUpdate();
+    return { success: true, lists: adEngine.loadedLists() };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// Map Electron's webRequest resourceType to @ghostery/adblocker's type names.
+function mapElectronResourceType(t) {
+  switch (t) {
+    case 'mainFrame':
+    case 'subFrame':     return 'document';
+    case 'stylesheet':   return 'stylesheet';
+    case 'script':       return 'script';
+    case 'image':        return 'image';
+    case 'font':         return 'font';
+    case 'object':       return 'object';
+    case 'xhr':          return 'xhr';
+    case 'ping':         return 'ping';
+    case 'cspReport':    return 'csp_report';
+    case 'media':        return 'media';
+    case 'webSocket':    return 'websocket';
+    default:             return 'other';
+  }
+}
+
+function isAdRequest(details) {
+  if (!adBlockerEnabled || !adEngine || !adEngineReady) return false;
+  try {
+    const sourceUrl = (details.documentURL && details.documentURL !== 'about:blank')
+      ? details.documentURL
+      : (details.frame && details.frame.url) || details.url;
+    const request = Request.fromRawDetails({
+      url: details.url,
+      sourceUrl,
+      type: mapElectronResourceType(details.resourceType),
+    });
+    return adEngine.match(request) !== null;
+  } catch {
+    return false;
+  }
+}
+
 function setupAdBlocker() {
   loadAdblockerConfig();
-  loadAdList();
+
+  // Fire-and-forget: init the engine in the background. The webRequest
+  // listener below is registered immediately but only blocks once the
+  // engine is ready.
+  initAdEngine().catch((err) => console.error('Ad engine init failed:', err));
 
   try {
     session.defaultSession.webRequest.onBeforeRequest({
-      urls: ['http://*/*', 'https://*/*']
+      urls: ['http://*/*', 'https://*/*'],
     }, (details, callback) => {
-      if (isAdUrl(details.url)) {
+      if (isAdRequest(details)) {
         blockedCount++;
         sendAdblockerUpdate();
         callback({ cancel: true });
@@ -168,48 +214,63 @@ function setupAdBlocker() {
   }
 }
 
-function fetchAdListFromUrl(urlString) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(urlString, { headers: { 'User-Agent': 'MiniBrowser/1.1' } }, (res) => {
-      // Follow one level of redirect
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        fetchAdListFromUrl(res.headers.location).then(resolve, reject);
-        return;
-      }
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode}`));
-        return;
-      }
-      let data = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => resolve(data));
-    });
-    req.on('error', reject);
-    req.setTimeout(15000, () => { req.destroy(new Error('Request timed out')); });
-  });
-}
+// Cosmetic filtering: on each page load, query the page for its classes
+// and ids, ask the engine for matching CSS, and inject it before the
+// browser paints. This is what hides ad slots that are embedded in the
+// page's own DOM (e.g. Spotify's "Sponsored" row) — network blocking
+// alone can't do that.
+function setupCosmeticFiltering() {
+  if (!view) return;
+  view.webContents.on('dom-ready', async () => {
+    if (!adBlockerEnabled || !adEngine || !adEngineReady) return;
+    const url = view.webContents.getURL();
+    if (!url || url === 'about:blank' || url.startsWith('file://')) return;
 
-async function updateAdList() {
-  try {
-    const text = await fetchAdListFromUrl(ADBLOCKER_UPDATE_URL);
-    const newDomains = loadAdListFromText(text);
-    if (newDomains.size === 0) {
-      return { success: false, error: 'Parsed list is empty' };
-    }
-    adDomains = newDomains;
-    blockedCount = 0;
+    let hostname;
+    try { hostname = new URL(url).hostname; } catch { return; }
+
+    let payload;
     try {
-      fs.writeFileSync(path.join(app.getPath('userData'), 'adblocker-list.txt'), text, 'utf8');
-    } catch (err) {
-      console.error('Failed to persist ad list:', err);
+      payload = await view.webContents.executeJavaScript(`(() => {
+        const els = document.querySelectorAll('*');
+        const classes = new Set();
+        for (const el of els) {
+          if (el.classList && el.classList.length) {
+            for (const c of el.classList) {
+              if (c && c.length <= 100) classes.add(c);
+              if (classes.size >= 500) break;
+            }
+          }
+          if (classes.size >= 500) break;
+        }
+        const idEls = document.querySelectorAll('[id]');
+        const ids = new Set();
+        for (const el of idEls) {
+          if (el.id) ids.add(el.id);
+          if (ids.size >= 500) break;
+        }
+        return JSON.stringify({ classes: [...classes], ids: [...ids] });
+      })()`);
+    } catch {
+      return;
     }
-    sendAdblockerUpdate();
-    return { success: true, count: adDomains.size };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
+    if (!payload) return;
+
+    let classes, ids;
+    try { ({ classes, ids } = JSON.parse(payload)); } catch { return; }
+
+    let cosmetic;
+    try {
+      cosmetic = adEngine.getCosmeticsFilters({ url, hostname, classes, ids });
+    } catch {
+      return;
+    }
+    if (cosmetic && cosmetic.stylesheet) {
+      try {
+        await view.webContents.insertCSS(cosmetic.stylesheet);
+      } catch {}
+    }
+  });
 }
 
 // ---------- command palette ----------
@@ -277,6 +338,11 @@ function createWindow() {
   win.contentView.addChildView(view);
   hideView();
   view.webContents.loadURL('about:blank');
+
+  // Cosmetic filtering: on every page load, inject CSS that hides ad
+  // elements (e.g. Spotify's "Sponsored" row). Network blocking alone
+  // can't do this — the ad slot is the site's own DOM.
+  setupCosmeticFiltering();
 
   // palette view (top of the stack) — added AFTER the site view so it renders above it
   paletteView = new WebContentsView({
@@ -460,7 +526,7 @@ ipcMain.on('palette-action', (_, action) => {
       break;
     case 'adblocker-update':
       // Fire-and-forget; the result arrives via 'adblocker-update' to the palette.
-      updateAdList();
+      updateAdEngineFromLists();
       break;
   }
 });
