@@ -39,9 +39,8 @@ mini/ (repo root, was helium-linux)
 │   ├── palette.html     # command palette UI (loaded into its own WebContentsView)
 │   ├── palette.css      # command palette styles (backdrop, card, items, footer)
 │   └── palette.js       # palette show/close/filter, executes actions via main
-adblocker/
-└── lists/
-    └── default.txt      # bundled starter list (~300 ad/tracking domains)
+# Ad blocker filter lists are NOT bundled — the engine fetches/loads them
+# at startup (prebuilt) or on Update (uBO filter lists from GitHub).
 └── agent.md / README.md
 ```
 
@@ -142,13 +141,15 @@ Separation: `ui/renderer.js` and `ui/palette.js` never touch `webContents` direc
 - Dynamic action: when the user has typed something, a top "Action" item appears — `Go to "<query>"` if the input looks like a URL (`http(s)://`, `localhost:port`, or `domain.tld`), otherwise `Search for "<query>"`. Selecting it sends `palette-action` to main, which routes through the same `toUrl` / view-load path.
 - Backdrop click, `Esc`, or `Ctrl+D` again sends `palette-close`; main hides the palette view and restores focus to the view (if a site is open) or the home page.
 
-### Ad blocker (uBlock-style, network-level)
+### Ad blocker (uBlock Origin-compatible engine)
 
-- Runs in `main.js` via `session.defaultSession.webRequest.onBeforeRequest` with a `http(s)://*/*` URL filter — every request is matched against the in-memory `adDomains` Set by walking parent domains (e.g. `cdn.ads.example.com` → `ads.example.com` → `example.com`). Default ON, persisted to `userData/config.json`.
-- Domain list: `adblocker/lists/default.txt` (~300 entries, curated). Parsed by `loadAdListFromText` which accepts both bare domains and hosts format. On startup, main prefers `userData/adblocker-list.txt` (saved by an Update) and falls back to the bundled list.
-- Counter: each cancelled request increments `blockedCount`; main throttles `adblocker-update` broadcasts to ≤1 per 400ms and pushes `{ enabled, blockedCount }` to both the home webContents and the palette webContents.
-- Palette toggle: `Ad Blocker: On · N blocked` / `Ad Blocker: Off` in the Privacy section. Sends `palette-action { type: 'adblocker-toggle' }`; main flips the flag, saves config, broadcasts.
-- Palette update: `Update Ad Blocker List` fetches `https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts` (HTTPS, 15s timeout, one redirect), parses it, replaces the in-memory Set, resets the counter, and persists to `userData/adblocker-list.txt`. Result comes back through the same `adblocker-update` event.
+- Engine: [`@ghostery/adblocker`](https://github.com/ghostery/adblocker) — a WebAssembly port of the uBlock Origin filter engine. Parses the same Adblock Plus filter syntax used by uBO / EasyList.
+- Startup: `initAdEngine` first tries to deserialize `userData/adblocker-engine.bin` (fastest, no network). On cache miss it falls back to `FiltersEngine.fromPrebuiltAdsAndTracking()`, a bundled engine with comprehensive ad + tracking lists. The result is persisted back to the cache file.
+- **Network blocking** (`setupAdBlocker` → `session.defaultSession.webRequest.onBeforeRequest` with `http(s)://*/*` filter): every request is turned into a `Request` via `Request.fromRawDetails({url, sourceUrl, type})` (Electron's `resourceType` is mapped: `mainFrame`/`subFrame`→`document`, `xhr`→`xhr`, `webSocket`→`websocket`, etc.) and fed to `engine.match(request)`. A non-null result means blocked.
+- **Cosmetic filtering** (`setupCosmeticFiltering` → `view.webContents.on('dom-ready')`): on every page load we run `executeJavaScript` to harvest the page's classes and ids (capped at 500 each), then call `engine.getCosmeticsFilters({url, hostname, classes, ids})` and `view.webContents.insertCSS(stylesheet)`. This hides ad slots that live in the site's own DOM (e.g. Spotify's "Sponsored" row) — which is the part network blocking alone cannot touch.
+- Counter: each cancelled request increments `blockedCount`; main throttles `adblocker-update` broadcasts to ≤1 per 400ms and pushes `{ enabled, blockedCount }` to both the home and palette webContents.
+- Palette toggle: `Ad Blocker: On · N blocked` / `Ad Blocker: Off` in the Privacy section. Sends `palette-action { type: 'adblocker-toggle' }`; main flips the flag, saves `userData/config.json`, broadcasts.
+- Palette update: `Update Ad Blocker List` calls `updateAdEngineFromLists`, which does `FiltersEngine.fromLists(fetch, ADBLOCKER_LIST_URLS)` against the latest uBO filter lists (uAssets `filters.txt` + `privacy.txt` from `raw.githubusercontent.com/uBlockOrigin/uAssets/master/`), resets the counter, and re-serializes the engine to disk.
 
 ## 8. Development Workflow
 
