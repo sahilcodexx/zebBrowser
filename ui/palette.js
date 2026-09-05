@@ -10,12 +10,32 @@ const paletteResults = document.getElementById('palette-results');
 let isOpen = false;
 let selectedIndex = 0;
 let commands = [];
+let adBlockerEnabled = true;
+let blockedCount = 0;
 
 const STATIC_COMMANDS = [
   { id: 'go-home',    label: 'Go Home',      icon: '⌂', shortcut: 'Ctrl+H', section: 'Navigation', keywords: ['home'] },
   { id: 'go-back',    label: 'Go Back',      icon: '←', shortcut: 'Alt+←',  section: 'Navigation', keywords: ['back', 'previous'] },
   { id: 'go-forward', label: 'Go Forward',   icon: '→', shortcut: 'Alt+→',  section: 'Navigation', keywords: ['forward', 'next'] },
   { id: 'reload',     label: 'Reload Page',  icon: '↻', shortcut: 'Ctrl+R', section: 'Navigation', keywords: ['reload', 'refresh'] },
+];
+
+// `label` may be a function so it can reflect live state (ad blocker count).
+const ADBLOCKER_COMMANDS = [
+  {
+    id: 'adblocker-toggle',
+    label: () => `Ad Blocker: ${adBlockerEnabled ? 'On' : 'Off'}${adBlockerEnabled ? ' · ' + blockedCount + ' blocked' : ''}`,
+    icon: '🛡',
+    section: 'Privacy',
+    keywords: ['adblock', 'ads', 'blocker', 'privacy', 'tracker', 'tracking', 'shield', 'blocked'],
+  },
+  {
+    id: 'adblocker-update',
+    label: 'Update Ad Blocker List',
+    icon: '⟳',
+    section: 'Privacy',
+    keywords: ['update', 'list', 'adblock', 'ads', 'refresh', 'sync'],
+  },
 ];
 
 function looksLikeUrl(text) {
@@ -43,9 +63,10 @@ function getCommands(query) {
     });
   }
 
-  for (const cmd of STATIC_COMMANDS) {
-    if (!q || cmd.label.toLowerCase().includes(q) || cmd.keywords.some(k => k.includes(q))) {
-      cmds.push(cmd);
+  for (const cmd of [...STATIC_COMMANDS, ...ADBLOCKER_COMMANDS]) {
+    const label = typeof cmd.label === 'function' ? cmd.label() : cmd.label;
+    if (!q || label.toLowerCase().includes(q) || cmd.keywords.some(k => k.includes(q))) {
+      cmds.push({ ...cmd, label });
     }
   }
 
@@ -196,4 +217,12 @@ window.electronAPI.onPaletteHide(() => {
   if (!isOpen) return;
   isOpen = false;
   palette.classList.add('hidden');
+});
+
+// main -> renderer: ad blocker status (toggle + count). Re-render so the
+// toggle command label stays in sync with the live state.
+window.electronAPI.onAdblockerUpdate((status) => {
+  adBlockerEnabled = status.enabled;
+  blockedCount = status.blockedCount;
+  if (isOpen) renderPalette();
 });
