@@ -17,6 +17,8 @@ googletraveladservices.com
 partner.googleadservices.com
 tpc.googlesyndication.com
 afs.googlesyndication.com
+adtrafficquality.google
+pagead46.l.doubleclick.click
 
 # --- Amazon ads (dl.amazon.in is the ad-creative CDN — the one that
 #     slipped through v1.2.0 and let Spotify's "Sponsored" row show) ---

@@ -219,19 +219,46 @@ async function updateAdList() {
 }
 
 // Cosmetic filtering: on every page load, inject CSS that hides the
-// common ad-slot patterns (e.g. Spotify's "Sponsored" row). This is
-// the part network blocking alone cannot touch — the ad slot is the
-// site's own DOM, so we need to hide it in CSS. The selector list is
-// intentionally conservative; users can toggle the ad blocker off if
-// it ever hides something legitimate.
+// common ad-slot patterns (e.g. Spotify's "Sponsored" row, YouTube's
+// "Sponsored" overlay). This is the part network blocking alone cannot
+// touch — the ad slot is the site's own DOM, so we need to hide it in
+// CSS. The selector list is intentionally conservative; users can
+// toggle the ad blocker off if it ever hides something legitimate.
+//
+// KNOWN LIMITATION — YouTube / YouTube Music video ads: the ad video
+// stream comes from googlevideo.com (the same CDN as content) and
+// plays in YouTube's own player element. We can hide the "Sponsored"
+// overlay and ad-slot renderers, but the ad video itself will still
+// play. For a truly ad-free YouTube Music experience, YouTube Music
+// Premium is required; a YouTube-player-hook (player.seekTo to skip
+// the ad) is possible but fragile.
 const ADBLOCKER_COSMETIC_CSS = `
+  /* generic */
   .ad, .ads, .ad-container, .ad-banner, .ad-wrapper, .ad-slot,
   .ad-placement, .ad-placement-slug, .ad-unit, .ad-zone,
   .advert, .advertisement, .advertising, .advertising-container,
   .sponsored, .promoted, .promotion, .sponsor,
   [data-ad], [data-ad-slot], [data-adunit], [data-advertisement],
   [data-testid="ad"], [aria-label="advertisement"],
-  [class*="Ad-"], [class*="Ads-"], [class*="Sponsored-"]
+  [class*="Ad-"], [class*="Ads-"], [class*="Sponsored-"],
+
+  /* YouTube / YouTube Music — hides Sponsored overlay, ad-slot
+     renderers, and the image-overlay banners. The ad video in the
+     main player will still play (see KNOWN LIMITATION above). */
+  ytd-ad-slot-renderer,
+  ytmusic-ad-slot-renderer,
+  ytmusic-ad-renderer,
+  .ytp-ad-text-overlay,
+  .ytp-ad-overlay-container,
+  .ytp-ad-image-overlay,
+  .ytp-ad-overlay-close-button,
+  .ytp-ad-persistent-progress-bar-container,
+  #player-ads,
+  #masthead-ad,
+  ytd-promoted-video-renderer,
+  ytd-display-ad-renderer,
+  ytd-in-feed-ad-layout-renderer,
+  ytd-rich-item-renderer:has(ytd-ad-slot-renderer)
 { display: none !important; }
 `;
 
