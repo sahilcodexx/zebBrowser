@@ -23,4 +23,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onPaletteHide: (cb) => ipcRenderer.on('palette-hide', cb),
   paletteAction: (action) => ipcRenderer.send('palette-action', action),
   closePalette: () => ipcRenderer.send('palette-close'),
+
+  // ad blocker: status pushed by main on every change
+  onAdblockerUpdate: (cb) => ipcRenderer.on('adblocker-update', (_, status) => cb(status)),
 });

@@ -1,4 +1,6 @@
-const { app, BrowserWindow, WebContentsView, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, shell, session } = require('electron');
+const fs = require('fs');
+const https = require('https');
 const path = require('path');
 
 const SEARCH_ENGINE = 'https://www.google.com/search?q=';
@@ -7,6 +9,14 @@ let viewVisible = false;
 let win;
 let view;       // site view (full-window when active)
 let paletteView; // command palette view (full-window on top of `view` when open)
+
+// --- ad blocker ---
+const ADBLOCKER_LIST_PATH = path.join(__dirname, 'adblocker', 'lists', 'default.txt');
+const ADBLOCKER_UPDATE_URL = 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts';
+let adBlockerEnabled = true;
+let blockedCount = 0;
+let adDomains = new Set();
+let lastAdblockerBroadcast = 0;
 
 function isUrl(text) {
   const t = text.trim();
@@ -48,6 +58,160 @@ function hideView() {
   try { view.webContents.loadURL('about:blank'); } catch {}
 }
 
+// ---------- ad blocker ----------
+
+// Parse a list of domains. Accepts either bare domains (one per line) or
+// hosts format ("127.0.0.1 domain.com" / "0.0.0.0 domain.com"). Skips
+// comments, blank lines, and obviously-not-host entries.
+function loadAdListFromText(text) {
+  const domains = new Set();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const parts = line.split(/\s+/);
+    const candidate = parts[parts.length - 1].toLowerCase();
+    if (!candidate) continue;
+    if (candidate === 'localhost') continue;
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(candidate)) continue; // bare IP
+    if (!/^[a-z0-9.-]+$/.test(candidate)) continue;
+    if (!candidate.includes('.')) continue;
+    domains.add(candidate);
+  }
+  return domains;
+}
+
+function loadAdList() {
+  // Prefer a user-saved list (after an Update), fall back to the bundled one.
+  const userListPath = path.join(app.getPath('userData'), 'adblocker-list.txt');
+  try {
+    const text = fs.readFileSync(userListPath, 'utf8');
+    adDomains = loadAdListFromText(text);
+    return;
+  } catch {}
+  try {
+    const text = fs.readFileSync(ADBLOCKER_LIST_PATH, 'utf8');
+    adDomains = loadAdListFromText(text);
+  } catch (err) {
+    console.error('Failed to load ad list:', err);
+    adDomains = new Set();
+  }
+}
+
+function loadAdblockerConfig() {
+  const configPath = path.join(app.getPath('userData'), 'config.json');
+  try {
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    adBlockerEnabled = config.adBlockerEnabled !== false;
+  } catch {
+    adBlockerEnabled = true; // default ON
+  }
+}
+
+function saveAdblockerConfig() {
+  const configPath = path.join(app.getPath('userData'), 'config.json');
+  try {
+    fs.writeFileSync(configPath, JSON.stringify({ adBlockerEnabled }, null, 2));
+  } catch (err) {
+    console.error('Failed to save ad blocker config:', err);
+  }
+}
+
+function isAdUrl(url) {
+  if (!adBlockerEnabled) return false;
+  let hostname;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  // Walk parent domains: cdn.example.com -> example.com -> com (skip com)
+  const parts = hostname.split('.');
+  for (let i = 0; i < parts.length - 1; i++) {
+    const domain = parts.slice(i).join('.');
+    if (adDomains.has(domain)) return true;
+  }
+  return false;
+}
+
+function sendAdblockerUpdate() {
+  // Throttle to at most one update per 400ms to avoid spamming the renderer
+  const now = Date.now();
+  if (blockedCount > 1 && now - lastAdblockerBroadcast < 400) return;
+  lastAdblockerBroadcast = now;
+
+  const status = { enabled: adBlockerEnabled, blockedCount };
+  const send = (wc) => {
+    if (wc && !wc.isDestroyed()) wc.send('adblocker-update', status);
+  };
+  send(win && win.webContents);
+  send(paletteView && paletteView.webContents);
+}
+
+function setupAdBlocker() {
+  loadAdblockerConfig();
+  loadAdList();
+
+  try {
+    session.defaultSession.webRequest.onBeforeRequest({
+      urls: ['http://*/*', 'https://*/*']
+    }, (details, callback) => {
+      if (isAdUrl(details.url)) {
+        blockedCount++;
+        sendAdblockerUpdate();
+        callback({ cancel: true });
+      } else {
+        callback({ cancel: false });
+      }
+    });
+  } catch (err) {
+    console.error('Failed to register ad blocker webRequest listener:', err);
+  }
+}
+
+function fetchAdListFromUrl(urlString) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(urlString, { headers: { 'User-Agent': 'MiniBrowser/1.1' } }, (res) => {
+      // Follow one level of redirect
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        fetchAdListFromUrl(res.headers.location).then(resolve, reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => resolve(data));
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(new Error('Request timed out')); });
+  });
+}
+
+async function updateAdList() {
+  try {
+    const text = await fetchAdListFromUrl(ADBLOCKER_UPDATE_URL);
+    const newDomains = loadAdListFromText(text);
+    if (newDomains.size === 0) {
+      return { success: false, error: 'Parsed list is empty' };
+    }
+    adDomains = newDomains;
+    blockedCount = 0;
+    try {
+      fs.writeFileSync(path.join(app.getPath('userData'), 'adblocker-list.txt'), text, 'utf8');
+    } catch (err) {
+      console.error('Failed to persist ad list:', err);
+    }
+    sendAdblockerUpdate();
+    return { success: true, count: adDomains.size };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
 // ---------- command palette ----------
 
 function showPalette() {
@@ -55,6 +219,8 @@ function showPalette() {
   const bounds = win.getContentBounds();
   paletteView.setBounds({ x: 0, y: 0, width: bounds.width, height: bounds.height });
   paletteView.webContents.focus();
+  // Send the current ad blocker state so the palette renders the right label/count.
+  paletteView.webContents.send('adblocker-update', { enabled: adBlockerEnabled, blockedCount });
   paletteView.webContents.send('palette-show');
 }
 
@@ -287,10 +453,20 @@ ipcMain.on('palette-action', (_, action) => {
         }
       }
       break;
+    case 'adblocker-toggle':
+      adBlockerEnabled = !adBlockerEnabled;
+      saveAdblockerConfig();
+      sendAdblockerUpdate();
+      break;
+    case 'adblocker-update':
+      // Fire-and-forget; the result arrives via 'adblocker-update' to the palette.
+      updateAdList();
+      break;
   }
 });
 
 app.whenReady().then(() => {
+  setupAdBlocker();
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

@@ -1,0 +1,338 @@
+# Mini Browser — Default Ad Blocker List
+# Curated starter list of common ad-serving, tracking, and analytics domains.
+# One domain per line. Lines starting with # are comments.
+# Matching: a request is blocked if its hostname equals or ends with any entry.
+# Update from the palette: "Update Ad Blocker List" (fetches pgl.yoyo.org).
+
+# --- Google ads & tracking ---
+doubleclick.net
+googlesyndication.com
+googletagservices.com
+googletagmanager.com
+google-analytics.com
+googleadservices.com
+adservice.google.com
+adservices.google.com
+googletraveladservices.com
+pagead2.googlesyndication.com
+partner.googleadservices.com
+tpc.googlesyndication.com
+afs.googlesyndication.com
+youtube.com/get_video_info
+
+# --- Amazon ads ---
+amazon-adsystem.com
+adsystem.amazon.com
+adserver.amazon.com
+associates.amazon.com
+
+# --- Meta / Facebook ---
+connect.facebook.net
+facebook.net
+fbcdn.net/connect
+
+# --- Twitter / X ---
+ads-twitter.com
+analytics.twitter.com
+
+# --- Microsoft / Bing ---
+bat.bing.com
+clarity.ms
+ads.microsoft.com
+
+# --- LinkedIn ---
+px.ads.linkedin.com
+snap.licdn.com
+
+# --- Pinterest ---
+ct.pinterest.com
+
+# --- Criteo ---
+criteo.com
+criteo.net
+bidder.criteo.com
+static.criteo.net
+
+# --- Taboola / Outbrain ---
+taboola.com
+trc.taboola.com
+cdn.taboola.com
+outbrain.com
+widgets.outbrain.com
+amplify.outbrain.com
+tr.outbrain.com
+
+# --- AppNexus / Xandr ---
+adnxs.com
+secure.adnxs.com
+ib.adnxs.com
+
+# --- Rubicon / Magnite ---
+rubiconproject.com
+fastlane.rubiconproject.com
+casale.rubiconproject.com
+
+# --- PubMatic ---
+pubmatic.com
+ads.pubmatic.com
+hbopenbid.pubmatic.com
+
+# --- OpenX ---
+openx.net
+us.openx.net
+uk.openx.net
+
+# --- Casale Media (Index Exchange) ---
+casalemedia.com
+indexww.com
+ssum-sec.casalemedia.com
+
+# --- SpotX ---
+spotxchange.com
+spotx.tv
+
+# --- Tremor / Telaria ---
+tremorhub.com
+telaria.net
+
+# --- Smart AdServer ---
+smartadserver.com
+ced.sascdn.com
+ssph.net
+ssp.smartadserver.com
+
+# --- Advertising.com / Yahoo ---
+advertising.com
+adserver.yahoo.com
+ads.yahoo.com
+analytics.yahoo.com
+pr-bh.ybp.yahoo.com
+
+# --- AdForm ---
+adform.net
+adform.com
+adx.adform.net
+
+# --- Yieldmo ---
+yieldmo.com
+yieldmo.imgix.net
+
+# --- Bidswitch / LiveRamp ---
+bidswitch.net
+rlcdn.com
+idsync.rlcdn.com
+pix.pxlclk.com
+pxlclk.com
+
+# --- DoubleVerify / IAS ---
+doubleverify.com
+cdn.doubleverify.com
+integralads.com
+cdn.adsafeprotected.com
+adsafeprotected.com
+static.adsafeprotected.com
+moatads.com
+moat.com
+s.moatads.com
+
+# --- Scorecard / Comscore / Quantcast ---
+scorecardresearch.com
+comscore.com
+quantserve.com
+quantcount.com
+
+# --- Mathtag / 33Across / LiveIntent ---
+mathtag.com
+33across.com
+liveintent.com
+li.33across.com
+
+# --- Sharethrough / Nativo / Teads ---
+sharethrough.com
+nativo.com
+teads.com
+teads.tv
+cdn.teads.tv
+
+# --- Connatix / Media.net ---
+connatix.com
+media.net
+
+# --- BuySellAds / Carbon Ads ---
+buysellads.com
+carbonads.com
+carbonads.net
+srv.carbonads.net
+cdn4.buysellads.net
+
+# --- Ezoic / Mediavine / AdThrive / Raptive / Monumetric ---
+ezoic.com
+ezodn.com
+g.ezoic.net
+mediavine.com
+adthrive.com
+raptive.com
+monumetric.com
+srv.pixels.net
+
+# --- Hotjar / Mouseflow / FullStory / Mixpanel / Segment / Amplitude ---
+hotjar.com
+script.hotjar.com
+static.hotjar.com
+mouseflow.com
+fullstory.com
+mixpanel.com
+cdn.mxpnl.com
+segment.com
+segment.io
+cdn.segment.com
+amplitude.com
+cdn.amplitude.com
+api.amplitude.com
+api.mixpanel.com
+
+# --- Chartbeat ---
+chartbeat.com
+chartbeat.net
+static.chartbeat.com
+
+# --- AdColony / AdMob / AdSterra / Airpush ---
+adcolony.com
+admob.com
+adsdk.com
+adsterra.com
+airpush.com
+
+# --- AppLovin / Chartboost / Elemental / Fyber ---
+applovin.com
+rtb.applovin.com
+chartboost.com
+elemental.com
+fyber.com
+
+# --- InMobi / ironSource / Leadbolt / MoPub ---
+inmobi.com
+ironsrc.com
+leadbolt.com
+mopub.com
+
+# --- NativeX / PubNative / Samsung Ads / SmartyAds ---
+nativex.com
+pubnative.net
+samsungcloudsolution.com
+smartyads.com
+
+# --- StartApp / Tapjoy / Unity Ads / Vungle ---
+startapp.com
+tapjoy.com
+unity3d.com
+ads.unity.com
+vungle.com
+
+# --- 2mdn (DoubleClick) ---
+2mdn.net
+
+# --- Generic ad-server paths (blocklist domain, not URL pattern) ---
+adnxs.net
+adition.com
+adscale.de
+adsymptotic.com
+atdmt.com
+atdmt2.com
+bluekai.com
+bkrtx.com
+casalemedia.net
+clicktale.net
+cnxad.com
+contextweb.com
+cpmstar.com
+ctasnet.com
+demdex.net
+dl-rms.com
+dmtry.com
+dotomi.com
+dpm.demo.engagio.com
+emxdgt.com
+ensighten.com
+everesttech.net
+exelator.com
+eyeota.net
+eyereturn.com
+fastclick.net
+gemius.pl
+go-mpulse.net
+googima.com
+gridsum.com
+gridsumdissector.com
+histats.com
+hotlog.ru
+hs-analytics.net
+hsadspixel.net
+imrworldwide.com
+insightexpressai.com
+intellitxt.com
+ivitrack.com
+krxd.net
+leadformix.com
+livehelper.com
+m6r.eu
+magg.net
+marinsm.com
+matomy.com
+maxymiser.com
+mediaforge.com
+meetrics.net
+mookie1.com
+myvisualiq.net
+netmng.com
+nexac.com
+nuggad.net
+omtrdc.net
+owneriq.net
+permutive.com
+pinterest.com/v3/
+predicta.com
+proxistore.com
+pswec.com
+quantummetric.com
+quigo.com
+reachforce.com
+retargeter.com
+revcontent.com
+rkdms.com
+rlau.com
+ru4.com
+serving-sys.com
+shareasale.com
+shopify.com/analytics
+sitemeter.com
+snoobi.com
+specificclick.net
+stardem.com
+statsit.com
+stickyadstv.com
+sumo.com
+sumome.com
+supertop.ru
+t.tailtarget.com
+tagcommander.com
+tailsweep.com
+tapad.com
+trackersimulator.org
+trackuity.com
+tradetracker.nl
+trafficfactory.biz
+tribalfusion.com
+turn.com
+tvsquared.com
+undertone.com
+userreport.com
+videohub.tv
+vindicosuite.com
+visualdna.com
+voluum.com
+weborama.fr
+xgraph.com
+yieldlab.net
+zedo.com
+zoomerang.com
