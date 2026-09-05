@@ -35,10 +35,13 @@ mini/ (repo root, was helium-linux)
 ├── ui/
 │   ├── index.html       # home: centered search input
 │   ├── style.css        # home pill styles
-│   ├── renderer.js      # home show/hide, navigation, Ctrl+K → request palette
+│   ├── renderer.js      # home show/hide, navigation, Ctrl+D → request palette
 │   ├── palette.html     # command palette UI (loaded into its own WebContentsView)
 │   ├── palette.css      # command palette styles (backdrop, card, items, footer)
 │   └── palette.js       # palette show/close/filter, executes actions via main
+adblocker/
+└── lists/
+    └── default.txt      # bundled starter list (~300 ad/tracking domains)
 └── agent.md / README.md
 ```
 
@@ -132,11 +135,20 @@ Separation: `ui/renderer.js` and `ui/palette.js` never touch `webContents` direc
 | `Esc` (home) | `renderer.js` | If a site is showing, go home |
 | `Ctrl+Shift+I` | `main.js` | Toggle DevTools (detach) |
 
-### Command palette (Ctrl+K)
+### Command palette (Ctrl+D)
 
 - Static commands: `Go Home` (⌂), `Go Back` (←), `Go Forward` (→), `Reload Page` (↻).
+- Privacy section: `Ad Blocker: On · N blocked` (toggle) and `Update Ad Blocker List`.
 - Dynamic action: when the user has typed something, a top "Action" item appears — `Go to "<query>"` if the input looks like a URL (`http(s)://`, `localhost:port`, or `domain.tld`), otherwise `Search for "<query>"`. Selecting it sends `palette-action` to main, which routes through the same `toUrl` / view-load path.
-- Backdrop click, `Esc`, or `Ctrl+K` again sends `palette-close`; main hides the palette view and restores focus to the view (if a site is open) or the home page.
+- Backdrop click, `Esc`, or `Ctrl+D` again sends `palette-close`; main hides the palette view and restores focus to the view (if a site is open) or the home page.
+
+### Ad blocker (uBlock-style, network-level)
+
+- Runs in `main.js` via `session.defaultSession.webRequest.onBeforeRequest` with a `http(s)://*/*` URL filter — every request is matched against the in-memory `adDomains` Set by walking parent domains (e.g. `cdn.ads.example.com` → `ads.example.com` → `example.com`). Default ON, persisted to `userData/config.json`.
+- Domain list: `adblocker/lists/default.txt` (~300 entries, curated). Parsed by `loadAdListFromText` which accepts both bare domains and hosts format. On startup, main prefers `userData/adblocker-list.txt` (saved by an Update) and falls back to the bundled list.
+- Counter: each cancelled request increments `blockedCount`; main throttles `adblocker-update` broadcasts to ≤1 per 400ms and pushes `{ enabled, blockedCount }` to both the home webContents and the palette webContents.
+- Palette toggle: `Ad Blocker: On · N blocked` / `Ad Blocker: Off` in the Privacy section. Sends `palette-action { type: 'adblocker-toggle' }`; main flips the flag, saves config, broadcasts.
+- Palette update: `Update Ad Blocker List` fetches `https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts` (HTTPS, 15s timeout, one redirect), parses it, replaces the in-memory Set, resets the counter, and persists to `userData/adblocker-list.txt`. Result comes back through the same `adblocker-update` event.
 
 ## 8. Development Workflow
 
