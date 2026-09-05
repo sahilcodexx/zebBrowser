@@ -1,6 +1,6 @@
 {
   "name": "mini-browser",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Minimal Chromium browser - search bar + shortcuts, no tabs/bookmarks/history",
   "main": "main.js",
   "type": "commonjs",
@@ -9,7 +9,12 @@
     "dev": "electron .",
     "build": "electron-builder --linux --publish never"
   },
-  "keywords": ["browser", "minimal", "electron", "chromium"],
+  "keywords": [
+    "browser",
+    "minimal",
+    "electron",
+    "chromium"
+  ],
   "author": "sahilcodexx <sahil171759@gmail.com>",
   "license": "GPL-3.0",
   "devDependencies": {
@@ -21,7 +26,10 @@
     "productName": "Mini Browser",
     "artifactName": "mini-browser-${version}.${ext}",
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "category": "Network",
       "icon": "build/icon.png",
       "maintainer": "sahilcodexx <sahil171759@gmail.com>"
@@ -29,5 +37,8 @@
     "directories": {
       "buildResources": "build"
     }
+  },
+  "dependencies": {
+    "@ghostery/adblocker": "^2.18.2"
   }
 }
