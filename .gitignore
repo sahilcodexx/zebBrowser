@@ -28,3 +28,8 @@ srcdir
 pkg
 *.pkg.tar*
 squashfs-root
+
+
+# Added by cargo
+
+/target
