@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Mini Browser
+GenericName=Web Browser
+Comment=Zen-inspired minimal browser built with Rust + GTK4
+Exec=mini-browser %U
+Icon=mini-browser
+Terminal=false
+Type=Application
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;application/xml;application/rss+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
+StartupWMClass=mini-browser
+Keywords=browser;web;internet;
