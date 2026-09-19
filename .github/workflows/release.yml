@@ -1,69 +1,100 @@
-name: release
+name: Release AppImage
 
 on:
   push:
     tags:
       - "v*"
-      - "zeb-v*"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-appimage:
     runs-on: ubuntu-22.04
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install system deps
+      - name: Install system dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y libfuse2 file
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libwebkit2gtk-4.1-dev \
+            libglib2.0-dev \
+            libcairo2-dev \
+            libpango1.0-dev \
+            libgdk-pixbuf-2.0-dev \
+            libadwaita-1-dev \
+            fuse \
+            wget
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-        env:
-          # pnpm allowBuilds needs explicit approval, ensure electron postinstall runs
-          CI: true
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Build AppImage
-        run: pnpm exec electron-builder --linux AppImage --publish never
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: List dist
-        run: ls -lh dist/ || ls -lh .
-
-      - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
+      - name: Cache Cargo
+        uses: actions/cache@v4
         with:
-          name: AppImage
           path: |
-            dist/*.AppImage
-          if-no-files-found: error
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Download linuxdeploy + appimagetool
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/releases/download/continuous/linuxdeploy-plugin-gtk-x86_64.AppImage
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk-x86_64.AppImage appimagetool-x86_64.AppImage
+
+      - name: Assemble AppDir
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+          cp target/release/light-browser AppDir/usr/bin/mini-browser
+          cp packaging/mini-browser.desktop AppDir/usr/share/applications/
+          cp packaging/mini-browser.png AppDir/usr/share/icons/hicolor/256x256/apps/
+
+          DEPLOY_GTK_VERSION=4 ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --plugin gtk \
+            --output appimage \
+            --desktop-file packaging/mini-browser.desktop \
+            --icon-file packaging/mini-browser.png
+
+      - name: Rename AppImage
+        run: |
+          mv Mini_Browser*.AppImage Mini-Browser-${{ github.ref_name }}-x86_64.AppImage
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*.AppImage
-          generate_release_notes: true
+          name: "Mini Browser ${{ github.ref_name }}"
+          body: |
+            ## Mini Browser ${{ github.ref_name }}
+
+            Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
+
+            ### What's new
+            - Auto-hide topbar (hover top edge to reveal, like Zen browser)
+            - Traffic-light window controls render as proper circles
+            - New Tab label no longer leaks raw `data:` URI
+            - URL bar fills center; nav buttons always visible
+            - Tabs float over web content via GTK Overlay for full-bleed pages
+
+            ### Install
+            Download `Mini-Browser-${{ github.ref_name }}-x86_64.AppImage`, make executable and run:
+            ```bash
+            chmod +x Mini-Browser-*.AppImage
+            ./Mini-Browser-*.AppImage
+            ```
+          files: Mini-Browser-${{ github.ref_name }}-x86_64.AppImage
           draft: false
           prerelease: false
-          fail_on_unmatched_files: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
