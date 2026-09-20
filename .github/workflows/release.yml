@@ -169,17 +169,52 @@ jobs:
               echo "WARNING: /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 not found on runner"
           fi
 
+          # ---- Patch RPATH on the helper binaries ---------------------------
+          # The helpers ship without an RPATH, so when the LD_PRELOAD shim
+          # redirects spawns to the bundled copies, those processes can't find
+          # their own dependencies (libwebkitgtk-6.0.so.4, libicudata.so.74,
+          # libjavascriptcoregtk-6.0.so.1, ...) and exit immediately with
+          # "error while loading shared libraries". The helpers live at
+          #   $APPDIR/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/<name>
+          # and the bundled libs are at
+          #   $APPDIR/usr/lib/<lib>
+          # so $ORIGIN/../.. resolves from the helper to the lib dir.
+          for helper in \
+              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitNetworkProcess \
+              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitWebProcess \
+              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitGPUProcess \
+              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/MiniBrowser; do
+              if [ -f "$helper" ]; then
+                  patchelf --set-rpath '$ORIGIN/../..' "$helper"
+                  echo "patched rpath on $helper -> $(patchelf --print-rpath "$helper")"
+              fi
+          done
+
           # ---- Build the LD_PRELOAD redirect shim --------------------------
           # See packaging/webkit-helper-redirect.c for the full explanation.
-          # The shim intercepts execve() in the main process; if the target
-          # path doesn't exist on the host AND matches a webkitgtk-6.0 helper
-          # pattern AND a copy exists under $APPDIR, it redirects to the
-          # bundled copy. On Debian/Ubuntu the system path exists, so the
-          # shim is a no-op and the system helpers are used.
+          # The shim intercepts execve, execv, execvp, execvpe, and
+          # posix_spawn in the parent process. If the target path doesn't
+          # exist on the host AND matches a webkitgtk-6.0 helper pattern AND
+          # a copy exists under $APPDIR, it redirects to the bundled copy.
+          # On Debian/Ubuntu the system path exists, so the shim is a no-op
+          # and the system helpers are used.
+          #
+          # Verify after building that all five symbols are exported — gcc
+          # version drift across runners has been observed to silently drop
+          # some of them, which makes the shim a no-op and the browser fails
+          # to start.
           gcc -shared -fPIC -O2 -Wall -Wextra \
               -o AppDir/usr/lib/libwebkit-helper-redirect.so \
               packaging/webkit-helper-redirect.c -ldl
           echo "redirect shim size: $(stat -c %s AppDir/usr/lib/libwebkit-helper-redirect.so) bytes"
+          EXPORTED=$(nm -D --defined-only AppDir/usr/lib/libwebkit-helper-redirect.so | awk '{print $3}' | tr '\n' ' ')
+          echo "redirect shim exported symbols: $EXPORTED"
+          for sym in execve posix_spawn execvp execv execvpe; do
+              if ! echo "$EXPORTED" | grep -qw "$sym"; then
+                  echo "FATAL: redirect shim is missing $sym — exec interception will not work" >&2
+                  exit 1
+              fi
+          done
 
           # ---- Replace linuxdeploy's AppRun symlink with our wrapper -------
           # linuxdeploy creates AppDir/AppRun as a symlink to the main
@@ -244,19 +279,27 @@ jobs:
 
             Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
 
-            ### What's new in v1.4.2
-            - **Bundles the WebKitGTK 6 helper binaries** (`WebKitNetworkProcess`,
-              `WebKitWebProcess`, `WebKitGPUProcess`, `jsc`, `MiniBrowser`) at the
-              Debian multiarch path inside the AppDir. These were missing in
-              v1.4.0 / v1.4.1, which caused the browser to crash silently on
-              non-Debian hosts (Arch, Fedora, openSUSE, …) before opening a
-              window.
-            - Adds an LD_PRELOAD shim (`libwebkit-helper-redirect.so`) that
-              transparently redirects the bundled library's helper-spawn path to
-              the bundled helpers when the system path is missing. No effect on
-              Debian/Ubuntu hosts where the system helpers are used.
-            - `AppRun` is a wrapper script (sets safe environment defaults and
-              writes a diagnostic log when launched without an attached terminal).
+            ### What's new in v1.4.3
+            - **Fixes silent launch on non-Debian hosts** (Arch, Fedora, openSUSE,
+              CachyOS, …). v1.4.2 still failed on these because:
+              1. The published LD_PRELOAD shim only exported `execve`; WebKitGTK 6
+                 actually uses `posix_spawn`, so the shim never fired.
+              2. The bundled helpers had no RPATH, so once they were launched they
+                 crashed with `error while loading shared libraries:
+                 libicudata.so.74`.
+              3. WebKitGTK 6 tries to sandbox helpers via `/usr/bin/bwrap`; on
+                 hosts without bwrap (or where the AppDir isn't visible inside
+                 the sandbox) this fails silently.
+            - The shim now exports all five symbols (`execve`, `execv`, `execvp`,
+              `execvpe`, `posix_spawn`) — the build fails loudly if any are
+              dropped by the compiler.
+            - The helper binaries get `$ORIGIN/../..` RPATH so they find the
+              bundled libraries.
+            - The wrapper sets `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`
+              so WebKit skips bwrap and launches helpers directly.
+            - `AppRun` is a wrapper script that logs a diagnostic file
+              (`~/.local/share/mini-browser/launch.log`) for file-manager
+              launches.
             - AppImage is type-1 (extract-and-run, no FUSE required).
 
             ### Install
