@@ -143,17 +143,13 @@ jobs:
             --icon-file packaging/mini-browser-256.png \
             $([ -n "$GMP_LIB" ] && echo "--library $GMP_LIB")
 
-          # linuxdeploy creates AppDir/AppRun as a symlink to the main
-          # executable. Replace it with our wrapper script so launches from
-          # a file manager (no terminal attached) get safe environment
-          # defaults and a diagnostic log file. See packaging/AppRun-wrapper.sh
-          # for details.
-          rm -f AppDir/AppRun
-          cp packaging/AppRun-wrapper.sh AppDir/AppRun
-          chmod +x AppDir/AppRun
-
-          echo "--- AppRun installed ---"
-          head -5 AppDir/AppRun
+          # v1.4.1 added a wrapper AppRun script here (sets safe env defaults
+          # like GDK_BACKEND=x11 / WEBKIT_DISABLE_DMABUF_RENDERER=1 and writes
+          # a diagnostic log) but the user reports the AppImage still does
+          # not launch from a file manager. v1.4.2 deliberately reverts to
+          # linuxdeploy's default AppRun symlink so we can isolate whether
+          # the wrapper was the cause. If v1.4.2 still fails to launch,
+          # the issue is in library packaging, not the wrapper.
           echo "--- libs bundled ---"
           find AppDir/usr/lib -maxdepth 1 -name '*.so*' | wc -l
 
@@ -206,19 +202,10 @@ jobs:
 
             Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
 
-            ### What's new
-            - AppImage is now **type-1** (extract-and-run): no FUSE required at
-              launch, so double-clicking from a file manager works reliably.
-            - Wrapper `AppRun` script sets safe environment defaults
-              (`GDK_BACKEND=x11`, `WEBKIT_DISABLE_DMABUF_RENDERER=1`) and
-              writes a diagnostic log to
-              `~/.local/share/mini-browser/launch.log` when launched without
-              a terminal attached.
-            - Auto-hide topbar (hover top edge to reveal, like Zen browser)
-            - Traffic-light window controls render as proper circles
-            - New Tab label no longer leaks raw `data:` URI
-            - URL bar fills center; nav buttons always visible
-            - Tabs float over web content via GTK Overlay for full-bleed pages
+            ### What's new in v1.4.2
+            - Removed the wrapper `AppRun` script added in v1.4.1 to isolate whether it was causing silent launch failures.
+            - The AppImage is still type-1 (extract-and-run, no FUSE required).
+            - **If v1.4.2 still does not launch, the issue is in library packaging, not the wrapper.**
 
             ### Install
             Download `Mini-Browser-${{ github.ref_name }}-x86_64.AppImage`, make executable and run:
