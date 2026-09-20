@@ -23,6 +23,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev \
             libwebkitgtk-6.0-dev \
+            libwebkitgtk-6.0-4 \
             libglib2.0-dev \
             libcairo2-dev \
             libpango1.0-dev \
@@ -36,7 +37,8 @@ jobs:
             patchelf \
             binutils \
             desktop-file-utils \
-            libfuse2
+            libfuse2 \
+            gcc
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -143,13 +145,53 @@ jobs:
             --icon-file packaging/mini-browser-256.png \
             $([ -n "$GMP_LIB" ] && echo "--library $GMP_LIB")
 
-          # v1.4.1 added a wrapper AppRun script here (sets safe env defaults
-          # like GDK_BACKEND=x11 / WEBKIT_DISABLE_DMABUF_RENDERER=1 and writes
-          # a diagnostic log) but the user reports the AppImage still does
-          # not launch from a file manager. v1.4.2 deliberately reverts to
-          # linuxdeploy's default AppRun symlink so we can isolate whether
-          # the wrapper was the cause. If v1.4.2 still fails to launch,
-          # the issue is in library packaging, not the wrapper.
+          # ---- Bundle WebKitGTK 6 helper binaries --------------------------
+          # The bundled libwebkitgtk-6.0.so.4 spawns WebKitNetworkProcess,
+          # WebKitWebProcess, WebKitGPUProcess at the Debian multiarch path
+          # /usr/lib/x86_64-linux-gnu/webkitgtk-6.0/. linuxdeploy only
+          # follows direct ldd dependencies, so those libexec-style helpers
+          # aren't bundled. On Debian/Ubuntu they exist system-wide, but on
+          # Arch/Fedora/openSUSE the path doesn't exist and the binary aborts
+          # before opening a window:
+          #   ERROR: Failed to spawn child process
+          #     "/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitNetworkProcess"
+          # Copy the helpers from the libwebkitgtk-6.0-4 package into the
+          # matching AppDir path. The LD_PRELOAD shim built below rewrites
+          # the spawn path so this AppDir copy is used on hosts that lack
+          # the system path.
+          mkdir -p AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0
+          if [ -d /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 ]; then
+              cp -a /usr/lib/x86_64-linux-gnu/webkitgtk-6.0/. \
+                  AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/
+              echo "bundled helpers:"
+              ls AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/
+          else
+              echo "WARNING: /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 not found on runner"
+          fi
+
+          # ---- Build the LD_PRELOAD redirect shim --------------------------
+          # See packaging/webkit-helper-redirect.c for the full explanation.
+          # The shim intercepts execve() in the main process; if the target
+          # path doesn't exist on the host AND matches a webkitgtk-6.0 helper
+          # pattern AND a copy exists under $APPDIR, it redirects to the
+          # bundled copy. On Debian/Ubuntu the system path exists, so the
+          # shim is a no-op and the system helpers are used.
+          gcc -shared -fPIC -O2 -Wall -Wextra \
+              -o AppDir/usr/lib/libwebkit-helper-redirect.so \
+              packaging/webkit-helper-redirect.c -ldl
+          echo "redirect shim size: $(stat -c %s AppDir/usr/lib/libwebkit-helper-redirect.so) bytes"
+
+          # ---- Replace linuxdeploy's AppRun symlink with our wrapper -------
+          # linuxdeploy creates AppDir/AppRun as a symlink to the main
+          # executable. Replace it with our wrapper script so launches from
+          # a file manager (no terminal attached) get safe environment
+          # defaults, the LD_PRELOAD shim above loaded, and a diagnostic log
+          # file. See packaging/AppRun-wrapper.sh for details.
+          rm -f AppDir/AppRun
+          cp packaging/AppRun-wrapper.sh AppDir/AppRun
+          chmod +x AppDir/AppRun
+          echo "--- AppRun installed ---"
+          head -5 AppDir/AppRun
           echo "--- libs bundled ---"
           find AppDir/usr/lib -maxdepth 1 -name '*.so*' | wc -l
 
@@ -203,9 +245,19 @@ jobs:
             Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
 
             ### What's new in v1.4.2
-            - Removed the wrapper `AppRun` script added in v1.4.1 to isolate whether it was causing silent launch failures.
-            - The AppImage is still type-1 (extract-and-run, no FUSE required).
-            - **If v1.4.2 still does not launch, the issue is in library packaging, not the wrapper.**
+            - **Bundles the WebKitGTK 6 helper binaries** (`WebKitNetworkProcess`,
+              `WebKitWebProcess`, `WebKitGPUProcess`, `jsc`, `MiniBrowser`) at the
+              Debian multiarch path inside the AppDir. These were missing in
+              v1.4.0 / v1.4.1, which caused the browser to crash silently on
+              non-Debian hosts (Arch, Fedora, openSUSE, …) before opening a
+              window.
+            - Adds an LD_PRELOAD shim (`libwebkit-helper-redirect.so`) that
+              transparently redirects the bundled library's helper-spawn path to
+              the bundled helpers when the system path is missing. No effect on
+              Debian/Ubuntu hosts where the system helpers are used.
+            - `AppRun` is a wrapper script (sets safe environment defaults and
+              writes a diagnostic log when launched without an attached terminal).
+            - AppImage is type-1 (extract-and-run, no FUSE required).
 
             ### Install
             Download `Mini-Browser-${{ github.ref_name }}-x86_64.AppImage`, make executable and run:

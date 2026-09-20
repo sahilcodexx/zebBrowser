@@ -39,6 +39,21 @@ fi
 # overridden by the user if they have a known-good GPU setup.
 export WEBKIT_DISABLE_DMABUF_RENDERER=${WEBKIT_DISABLE_DMABUF_RENDERER:-1}
 
+# ---- WebKitGTK helper redirection ------------------------------------------
+# The bundled libwebkitgtk-6.0.so.4 was built on Ubuntu 24.04 and spawns its
+# helper processes (WebKitNetworkProcess, WebKitWebProcess, WebKitGPUProcess)
+# from the Debian multiarch path /usr/lib/x86_64-linux-gnu/webkitgtk-6.0/.
+# On non-Debian hosts that directory doesn't exist and the binary crashes
+# before any window opens. We bundle those helpers at the matching path inside
+# the AppDir and load a tiny LD_PRELOAD shim
+# (packaging/webkit-helper-redirect.c) that rewrites the missing paths to
+# point at the bundled copies. On Debian/Ubuntu hosts the system helpers
+# already exist, so the shim is a no-op.
+export APPDIR="$SCRIPT_DIR"
+if [ -f "$SCRIPT_DIR/usr/lib/libwebkit-helper-redirect.so" ]; then
+    export LD_PRELOAD="$SCRIPT_DIR/usr/lib/libwebkit-helper-redirect.so${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
 # ---- Sanity checks ----------------------------------------------------------
 if [ ! -x "$BIN" ]; then
     echo "AppRun: error: $BIN not found or not executable." >&2
