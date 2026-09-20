@@ -28,6 +28,7 @@ jobs:
             libpango1.0-dev \
             libgdk-pixbuf-2.0-dev \
             libadwaita-1-dev \
+            imagemagick \
             fuse \
             wget \
             curl \
@@ -52,16 +53,29 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Download linuxdeploy + gtk plugin + appimagetool (pinned releases)
+      - name: Prepare icon (force 256x256)
+        # linuxdeploy rejects icons whose x/y resolution differ or aren't on its
+        # whitelist (256x256 is). The source logo is 818x834; we resize + center.
+        run: |
+          convert packaging/mini-browser.png \
+            -resize x256 \
+            -resize 256x256 \
+            -background none \
+            -gravity center \
+            -extent 256x256 \
+            packaging/mini-browser-256.png
+          file packaging/mini-browser-256.png
+
+      - name: Download linuxdeploy + appimagetool
         run: |
           set -e
-          # Pinned to a stable, recent alpha so the URL doesn't depend on the
-          # moving "continuous" tag and its flake-prone asset URLs.
+          # Pinned linuxdeploy so the URL is stable.
           LINUXDEPLOY_VER=1-alpha-20251107-1
           APPIMAGETOOL_VER=continuous
           for i in 1 2 3 4 5; do
             set +e
-            curl -fsSL --connect-timeout 15 --max-time 120 \
+            curl -fsSL --connect-timeout 15 --max-time 300 \
+              --retry 3 --retry-delay 2 \
               -o linuxdeploy-x86_64.AppImage \
               "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VER}/linuxdeploy-x86_64.AppImage" \
               && break
@@ -71,17 +85,8 @@ jobs:
           done
           for i in 1 2 3 4 5; do
             set +e
-            curl -fsSL --connect-timeout 15 --max-time 120 \
-              -o linuxdeploy-plugin-gtk-x86_64.AppImage \
-              "https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/releases/download/${LINUXDEPLOY_VER}/linuxdeploy-plugin-gtk-x86_64.AppImage" \
-              && break
-            echo "linuxdeploy-plugin-gtk download attempt $i failed, retrying..."
-            sleep 5
-            set -e
-          done
-          for i in 1 2 3 4 5; do
-            set +e
-            curl -fsSL --connect-timeout 15 --max-time 120 \
+            curl -fsSL --connect-timeout 15 --max-time 300 \
+              --retry 3 --retry-delay 2 \
               -o appimagetool-x86_64.AppImage \
               "https://github.com/AppImage/AppImageKit/releases/download/${APPIMAGETOOL_VER}/appimagetool-x86_64.AppImage" \
               && break
@@ -89,10 +94,32 @@ jobs:
             sleep 5
             set -e
           done
-          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk-x86_64.AppImage appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage appimagetool-x86_64.AppImage
           ls -lh *.AppImage
 
+      - name: Patch linuxdeploy's embedded strip
+        # linuxdeploy bundles an old binutils `strip` snapshot that doesn't
+        # understand the modern `.relr.dyn` ELF section (type 0x13) used by
+        # current glibc-built libraries — every strip call exits non-zero,
+        # polluting the build. We extract the AppImage and replace its
+        # embedded strip with the system binutils from `binutils` (above).
+        run: |
+          set -e
+          ./linuxdeploy-x86_64.AppImage --appimage-extract > /dev/null
+          cat > squashfs-root/usr/bin/strip <<'EOF'
+          #!/bin/sh
+          # Delegate to system strip: binutils >= 2.36 knows .relr.dyn.
+          exec /usr/bin/strip "$@"
+          EOF
+          chmod +x squashfs-root/usr/bin/strip
+          echo "Patched strip wrapper:"
+          cat squashfs-root/usr/bin/strip
+
       - name: Assemble AppDir
+        # Run linuxdeploy WITHOUT --plugin gtk and WITHOUT --output appimage.
+        # linuxdeploy-plugin-gtk has no published releases (404s on every tag),
+        # so we let the built-in GTK detector (DEPLOY_GTK_VERSION=4) do the
+        # bundling and call appimagetool ourselves in the next step.
         run: |
           set -e
           rm -rf AppDir
@@ -102,20 +129,29 @@ jobs:
 
           cp target/release/light-browser AppDir/usr/bin/mini-browser
           cp packaging/mini-browser.desktop AppDir/usr/share/applications/
-          cp packaging/mini-browser.png AppDir/usr/share/icons/hicolor/256x256/apps/
+          cp packaging/mini-browser-256.png AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png
+
+          # Force-include libgmp so the AppImage is fully self-contained.
+          # linuxdeploy blacklists it as a "system lib", which is wrong for a
+          # portable AppImage that should run on any distro.
+          GMP_LIB=$(ldconfig -p | awk '/libgmp\.so\.10/ {print $NF; exit}')
 
           export DEPLOY_GTK_VERSION=4
-          ./linuxdeploy-x86_64.AppImage \
+          ./squashfs-root/AppRun \
             --appdir AppDir \
-            --plugin gtk \
-            --output appimage \
             --desktop-file packaging/mini-browser.desktop \
-            --icon-file packaging/mini-browser.png
+            --icon-file packaging/mini-browser-256.png \
+            $([ -n "$GMP_LIB" ] && echo "--library $GMP_LIB")
 
-      - name: Rename AppImage
+          echo "--- libs bundled ---"
+          find AppDir/usr/lib -maxdepth 1 -name '*.so*' | wc -l
+
+      - name: Package AppImage
         run: |
           set -e
-          mv Mini_Browser*.AppImage Mini-Browser-${{ github.ref_name }}-x86_64.AppImage
+          ./appimagetool-x86_64.AppImage \
+            AppDir \
+            "Mini-Browser-${GITHUB_REF_NAME}-x86_64.AppImage"
           ls -lh Mini-Browser-*.AppImage
 
       - name: Create GitHub Release
