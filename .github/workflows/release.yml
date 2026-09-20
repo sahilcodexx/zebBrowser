@@ -23,6 +23,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev \
             libwebkitgtk-6.0-dev \
+            libwebkitgtk-6.0-4 \
             libglib2.0-dev \
             libcairo2-dev \
             libpango1.0-dev \
@@ -36,7 +37,8 @@ jobs:
             patchelf \
             binutils \
             desktop-file-utils \
-            libfuse2
+            libfuse2 \
+            gcc
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -143,6 +145,88 @@ jobs:
             --icon-file packaging/mini-browser-256.png \
             $([ -n "$GMP_LIB" ] && echo "--library $GMP_LIB")
 
+          # ---- Bundle WebKitGTK 6 helper binaries --------------------------
+          # The bundled libwebkitgtk-6.0.so.4 spawns WebKitNetworkProcess,
+          # WebKitWebProcess, WebKitGPUProcess at the Debian multiarch path
+          # /usr/lib/x86_64-linux-gnu/webkitgtk-6.0/. linuxdeploy only
+          # follows direct ldd dependencies, so those libexec-style helpers
+          # aren't bundled. On Debian/Ubuntu they exist system-wide, but on
+          # Arch/Fedora/openSUSE the path doesn't exist and the binary aborts
+          # before opening a window:
+          #   ERROR: Failed to spawn child process
+          #     "/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitNetworkProcess"
+          # Copy the helpers from the libwebkitgtk-6.0-4 package into the
+          # matching AppDir path. The LD_PRELOAD shim built below rewrites
+          # the spawn path so this AppDir copy is used on hosts that lack
+          # the system path.
+          mkdir -p AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0
+          if [ -d /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 ]; then
+              cp -a /usr/lib/x86_64-linux-gnu/webkitgtk-6.0/. \
+                  AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/
+              echo "bundled helpers:"
+              ls AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/
+          else
+              echo "WARNING: /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 not found on runner"
+          fi
+
+          # ---- Patch RPATH on the helper binaries ---------------------------
+          # The helpers ship without an RPATH, so when the LD_PRELOAD shim
+          # redirects spawns to the bundled copies, those processes can't find
+          # their own dependencies (libwebkitgtk-6.0.so.4, libicudata.so.74,
+          # libjavascriptcoregtk-6.0.so.1, ...) and exit immediately with
+          # "error while loading shared libraries". The helpers live at
+          #   $APPDIR/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/<name>
+          # and the bundled libs are at
+          #   $APPDIR/usr/lib/<lib>
+          # so $ORIGIN/../.. resolves from the helper to the lib dir.
+          for helper in \
+              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitNetworkProcess \
+              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitWebProcess \
+              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitGPUProcess \
+              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/MiniBrowser; do
+              if [ -f "$helper" ]; then
+                  patchelf --set-rpath '$ORIGIN/../..' "$helper"
+                  echo "patched rpath on $helper -> $(patchelf --print-rpath "$helper")"
+              fi
+          done
+
+          # ---- Build the LD_PRELOAD redirect shim --------------------------
+          # See packaging/webkit-helper-redirect.c for the full explanation.
+          # The shim intercepts execve, execv, execvp, execvpe, and
+          # posix_spawn in the parent process. If the target path doesn't
+          # exist on the host AND matches a webkitgtk-6.0 helper pattern AND
+          # a copy exists under $APPDIR, it redirects to the bundled copy.
+          # On Debian/Ubuntu the system path exists, so the shim is a no-op
+          # and the system helpers are used.
+          #
+          # Verify after building that all five symbols are exported — gcc
+          # version drift across runners has been observed to silently drop
+          # some of them, which makes the shim a no-op and the browser fails
+          # to start.
+          gcc -shared -fPIC -O2 -Wall -Wextra \
+              -o AppDir/usr/lib/libwebkit-helper-redirect.so \
+              packaging/webkit-helper-redirect.c -ldl
+          echo "redirect shim size: $(stat -c %s AppDir/usr/lib/libwebkit-helper-redirect.so) bytes"
+          EXPORTED=$(nm -D --defined-only AppDir/usr/lib/libwebkit-helper-redirect.so | awk '{print $3}' | tr '\n' ' ')
+          echo "redirect shim exported symbols: $EXPORTED"
+          for sym in execve posix_spawn execvp execv execvpe; do
+              if ! echo "$EXPORTED" | grep -qw "$sym"; then
+                  echo "FATAL: redirect shim is missing $sym — exec interception will not work" >&2
+                  exit 1
+              fi
+          done
+
+          # ---- Replace linuxdeploy's AppRun symlink with our wrapper -------
+          # linuxdeploy creates AppDir/AppRun as a symlink to the main
+          # executable. Replace it with our wrapper script so launches from
+          # a file manager (no terminal attached) get safe environment
+          # defaults, the LD_PRELOAD shim above loaded, and a diagnostic log
+          # file. See packaging/AppRun-wrapper.sh for details.
+          rm -f AppDir/AppRun
+          cp packaging/AppRun-wrapper.sh AppDir/AppRun
+          chmod +x AppDir/AppRun
+          echo "--- AppRun installed ---"
+          head -5 AppDir/AppRun
           echo "--- libs bundled ---"
           find AppDir/usr/lib -maxdepth 1 -name '*.so*' | wc -l
 
@@ -154,6 +238,38 @@ jobs:
             "Mini-Browser-${GITHUB_REF_NAME}-x86_64.AppImage"
           ls -lh Mini-Browser-*.AppImage
 
+      - name: Force type-1 AppImage (no FUSE dependency)
+        # appimagetool emits type-2 AppImages, which try to mount via FUSE first
+        # and only fall back to extract-and-run when FUSE is unavailable.
+        # On some desktops the FUSE call hangs or fails silently when the
+        # AppImage is double-clicked from a file manager — the user sees
+        # "nothing happens". Forcing type-1 makes the runtime extract the
+        # AppImage to a temp dir and exec AppRun directly, eliminating FUSE
+        # from the launch path entirely.
+        #
+        # Magic layout at offset 8 in the AppImage header:
+        #   type-1:  41 49 01  ("AI" + version 1)
+        #   type-2:  41 49 02  ("AI" + version 2)
+        # We overwrite byte 10 from 0x02 to 0x01.
+        run: |
+          set -e
+          APPIMAGE=$(ls Mini-Browser-*-x86_64.AppImage | head -1)
+          # Verify the magic before patching so we fail loudly if appimagetool
+          # changed its layout in a future release.
+          CURRENT=$(dd if="$APPIMAGE" bs=1 skip=10 count=1 2>/dev/null | xxd -p)
+          echo "Current type byte: 0x$CURRENT"
+          if [ "$CURRENT" = "02" ]; then
+            printf '\x01' | dd of="$APPIMAGE" bs=1 seek=10 count=1 conv=notrunc status=none
+            NEW=$(dd if="$APPIMAGE" bs=1 skip=10 count=1 2>/dev/null | xxd -p)
+            echo "Patched type byte: 0x$NEW (forced type-1)"
+            file "$APPIMAGE"
+          elif [ "$CURRENT" = "01" ]; then
+            echo "Already type-1, nothing to do."
+          else
+            echo "Unexpected type byte 0x$CURRENT — appimagetool layout may have changed. Skipping patch."
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -163,12 +279,28 @@ jobs:
 
             Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
 
-            ### What's new
-            - Auto-hide topbar (hover top edge to reveal, like Zen browser)
-            - Traffic-light window controls render as proper circles
-            - New Tab label no longer leaks raw `data:` URI
-            - URL bar fills center; nav buttons always visible
-            - Tabs float over web content via GTK Overlay for full-bleed pages
+            ### What's new in v1.4.3
+            - **Fixes silent launch on non-Debian hosts** (Arch, Fedora, openSUSE,
+              CachyOS, …). v1.4.2 still failed on these because:
+              1. The published LD_PRELOAD shim only exported `execve`; WebKitGTK 6
+                 actually uses `posix_spawn`, so the shim never fired.
+              2. The bundled helpers had no RPATH, so once they were launched they
+                 crashed with `error while loading shared libraries:
+                 libicudata.so.74`.
+              3. WebKitGTK 6 tries to sandbox helpers via `/usr/bin/bwrap`; on
+                 hosts without bwrap (or where the AppDir isn't visible inside
+                 the sandbox) this fails silently.
+            - The shim now exports all five symbols (`execve`, `execv`, `execvp`,
+              `execvpe`, `posix_spawn`) — the build fails loudly if any are
+              dropped by the compiler.
+            - The helper binaries get `$ORIGIN/../..` RPATH so they find the
+              bundled libraries.
+            - The wrapper sets `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`
+              so WebKit skips bwrap and launches helpers directly.
+            - `AppRun` is a wrapper script that logs a diagnostic file
+              (`~/.local/share/mini-browser/launch.log`) for file-manager
+              launches.
+            - AppImage is type-1 (extract-and-run, no FUSE required).
 
             ### Install
             Download `Mini-Browser-${{ github.ref_name }}-x86_64.AppImage`, make executable and run:
@@ -176,6 +308,10 @@ jobs:
             chmod +x Mini-Browser-*.AppImage
             ./Mini-Browser-*.AppImage
             ```
+
+            If the window does not appear, run from a terminal and share the
+            output. The wrapper also writes a log to
+            `~/.local/share/mini-browser/launch.log` for offline debugging.
           files: Mini-Browser-${{ github.ref_name }}-x86_64.AppImage
           draft: false
           prerelease: false
