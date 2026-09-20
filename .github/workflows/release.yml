@@ -143,6 +143,17 @@ jobs:
             --icon-file packaging/mini-browser-256.png \
             $([ -n "$GMP_LIB" ] && echo "--library $GMP_LIB")
 
+          # linuxdeploy creates AppDir/AppRun as a symlink to the main
+          # executable. Replace it with our wrapper script so launches from
+          # a file manager (no terminal attached) get safe environment
+          # defaults and a diagnostic log file. See packaging/AppRun-wrapper.sh
+          # for details.
+          rm -f AppDir/AppRun
+          cp packaging/AppRun-wrapper.sh AppDir/AppRun
+          chmod +x AppDir/AppRun
+
+          echo "--- AppRun installed ---"
+          head -5 AppDir/AppRun
           echo "--- libs bundled ---"
           find AppDir/usr/lib -maxdepth 1 -name '*.so*' | wc -l
 
@@ -154,6 +165,38 @@ jobs:
             "Mini-Browser-${GITHUB_REF_NAME}-x86_64.AppImage"
           ls -lh Mini-Browser-*.AppImage
 
+      - name: Force type-1 AppImage (no FUSE dependency)
+        # appimagetool emits type-2 AppImages, which try to mount via FUSE first
+        # and only fall back to extract-and-run when FUSE is unavailable.
+        # On some desktops the FUSE call hangs or fails silently when the
+        # AppImage is double-clicked from a file manager — the user sees
+        # "nothing happens". Forcing type-1 makes the runtime extract the
+        # AppImage to a temp dir and exec AppRun directly, eliminating FUSE
+        # from the launch path entirely.
+        #
+        # Magic layout at offset 8 in the AppImage header:
+        #   type-1:  41 49 01  ("AI" + version 1)
+        #   type-2:  41 49 02  ("AI" + version 2)
+        # We overwrite byte 10 from 0x02 to 0x01.
+        run: |
+          set -e
+          APPIMAGE=$(ls Mini-Browser-*-x86_64.AppImage | head -1)
+          # Verify the magic before patching so we fail loudly if appimagetool
+          # changed its layout in a future release.
+          CURRENT=$(dd if="$APPIMAGE" bs=1 skip=10 count=1 2>/dev/null | xxd -p)
+          echo "Current type byte: 0x$CURRENT"
+          if [ "$CURRENT" = "02" ]; then
+            printf '\x01' | dd of="$APPIMAGE" bs=1 seek=10 count=1 conv=notrunc status=none
+            NEW=$(dd if="$APPIMAGE" bs=1 skip=10 count=1 2>/dev/null | xxd -p)
+            echo "Patched type byte: 0x$NEW (forced type-1)"
+            file "$APPIMAGE"
+          elif [ "$CURRENT" = "01" ]; then
+            echo "Already type-1, nothing to do."
+          else
+            echo "Unexpected type byte 0x$CURRENT — appimagetool layout may have changed. Skipping patch."
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -164,6 +207,13 @@ jobs:
             Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
 
             ### What's new
+            - AppImage is now **type-1** (extract-and-run): no FUSE required at
+              launch, so double-clicking from a file manager works reliably.
+            - Wrapper `AppRun` script sets safe environment defaults
+              (`GDK_BACKEND=x11`, `WEBKIT_DISABLE_DMABUF_RENDERER=1`) and
+              writes a diagnostic log to
+              `~/.local/share/mini-browser/launch.log` when launched without
+              a terminal attached.
             - Auto-hide topbar (hover top edge to reveal, like Zen browser)
             - Traffic-light window controls render as proper circles
             - New Tab label no longer leaks raw `data:` URI
@@ -176,6 +226,10 @@ jobs:
             chmod +x Mini-Browser-*.AppImage
             ./Mini-Browser-*.AppImage
             ```
+
+            If the window does not appear, run from a terminal and share the
+            output. The wrapper also writes a log to
+            `~/.local/share/mini-browser/launch.log` for offline debugging.
           files: Mini-Browser-${{ github.ref_name }}-x86_64.AppImage
           draft: false
           prerelease: false
