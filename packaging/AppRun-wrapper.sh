@@ -138,10 +138,14 @@ write_log_header() {
 }
 
 # Decide which launch strategy to use based on what's available.
+# NOTE: test actual mount-ns capability, not just `command -v unshare`.
+# On Arch/CachyOS hardened kernels `unshare --mount` returns `Operation not permitted`
+# even though the binary exists — previous check caused `unshare-bind-mount`
+# to be chosen and then fail on double-click (no TTY).
 launch_strategy=""
 if [ -d "$HELPERS_DST" ] && [ -x "$HELPERS_DST/WebKitNetworkProcess" ]; then
     launch_strategy="system-helpers"
-elif [ -d "$HELPERS_SRC" ] && command -v unshare >/dev/null 2>&1; then
+elif [ -d "$HELPERS_SRC" ] && unshare --mount --propagation private true 2>/dev/null; then
     launch_strategy="unshare-bind-mount"
 elif [ -n "${LD_PRELOAD:-}" ]; then
     launch_strategy="ld-preload-only"
@@ -178,12 +182,24 @@ case "$launch_strategy" in
         # Inner sh argv: sh HELPERS_SRC HELPERS_DST BIN user-args...
         # $1, $2 are bind source/dest; $3 onwards is binary path + user args.
         mkdir -p "$HELPERS_DST" 2>/dev/null || true
-        unshare --mount --propagation private sh -c '
+        if ! unshare --mount --propagation private sh -c '
             mount --bind "$1" "$2" || exit 1
             shift 2
             exec "$@"
-        ' sh "$HELPERS_SRC" "$HELPERS_DST" "$BIN" "$@" >> "$LOG_FILE" 2>&1
-        exit_code=$?
+        ' sh "$HELPERS_SRC" "$HELPERS_DST" "$BIN" "$@" >> "$LOG_FILE" 2>&1; then
+            exit_code=$?
+            # Fallback: mount-ns failed at runtime (kernel restriction)
+            # Use LD_PRELOAD shim instead — this is what Arch/CachyOS needs.
+            {
+                echo "unshare bind-mount failed (exit $exit_code); falling back to LD_PRELOAD shim" >> "$LOG_FILE" 2>&1 || true
+            }
+            if [ -n "${LD_PRELOAD:-}" ]; then
+                "$BIN" "$@" >> "$LOG_FILE" 2>&1
+                exit_code=$?
+            fi
+        else
+            exit_code=0
+        fi
         ;;
     ld-preload-only)
         {
