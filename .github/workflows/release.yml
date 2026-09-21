@@ -230,11 +230,11 @@ jobs:
           # ---- Fix icon for AppImage file thumbnail (every distro) ----------
           # linuxdeploy creates .DirIcon/mini-browser.png as symlinks to
           # hicolor/256x256 which some file managers (Dolphin/Nautilus
-          # thumbd) don't follow when the AppImage is type-1 or when
-          # thumbnailing without FUSE. Copy real files so the icon shows
+          # thumbd) don't follow. Copy real files so the icon shows
           # even before integration, on all DEs.
-          cp -f AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png AppDir/.DirIcon
-          cp -f AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png AppDir/mini-browser.png
+          rm -f AppDir/.DirIcon AppDir/mini-browser.png
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png AppDir/.DirIcon
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png AppDir/mini-browser.png
           # Provide additional sizes for HiDPI / older DEs
           for sz in 16 32 64 128 256; do
             mkdir -p "AppDir/usr/share/icons/hicolor/${sz}x${sz}/apps"
