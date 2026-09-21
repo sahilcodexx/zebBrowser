@@ -68,6 +68,25 @@ if [ -f "$SCRIPT_DIR/usr/lib/libwebkit-helper-redirect.so" ]; then
     export LD_PRELOAD="$SCRIPT_DIR/usr/lib/libwebkit-helper-redirect.so${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
+# ---- TLS / GIO / CA certs (fix “TLS support is not available” in AppImage) ----
+# Host glib-networking provides /usr/lib/gio/modules/libgiognutls.so etc.
+# Without bundling, libsoup in the AppImage cannot do HTTPS.
+if [ -d "$SCRIPT_DIR/usr/lib/gio/modules" ]; then
+    export GIO_MODULE_DIR="$SCRIPT_DIR/usr/lib/gio/modules"
+fi
+if [ -d "$SCRIPT_DIR/usr/lib/x86_64-linux-gnu/gio/modules" ]; then
+    export GIO_MODULE_DIR="$SCRIPT_DIR/usr/lib/x86_64-linux-gnu/gio/modules:$GIO_MODULE_DIR"
+fi
+if [ -d "$SCRIPT_DIR/usr/share/glib-2.0/schemas" ]; then
+    export GSETTINGS_SCHEMA_DIR="$SCRIPT_DIR/usr/share/glib-2.0/schemas"
+fi
+if [ -f "$SCRIPT_DIR/etc/ssl/certs/ca-certificates.crt" ]; then
+    export SSL_CERT_FILE="$SCRIPT_DIR/etc/ssl/certs/ca-certificates.crt"
+    export SSL_CERT_DIR="$SCRIPT_DIR/etc/ssl/certs"
+    export CURL_CA_BUNDLE="$SSL_CERT_FILE"
+    export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
+fi
+
 # ---- Sanity check the binary ------------------------------------------------
 if [ ! -x "$BIN" ]; then
     echo "AppRun: error: $BIN not found or not executable." >&2

@@ -1015,13 +1015,13 @@ fn install_css() {
         /* Remove any icon/label padding GTK might inject */
         .traffic-dot > * { padding: 0; margin: 0; }
 
-        .traffic-close { background-color: #ff5f57; }
-        .traffic-min   { background-color: #ffbd2e; }
-        .traffic-zoom  { background-color: #28c840; }
+        .traffic-close { background: #ff5f57; background-image: none; }
+        .traffic-min   { background: #ffbd2e; background-image: none; }
+        .traffic-zoom  { background: #28c840; background-image: none; }
 
-        .traffic-close:hover { background-color: #e0443c; }
-        .traffic-min:hover   { background-color: #e0a012; }
-        .traffic-zoom:hover  { background-color: #14a830; }
+        .traffic-close:hover { background: #e0443c; background-image: none; }
+        .traffic-min:hover   { background: #e0a012; background-image: none; }
+        .traffic-zoom:hover  { background: #14a830; background-image: none; }
 
         /* ── Nav buttons ───────────────────────────────────────── */
         .nav-group {

@@ -38,7 +38,10 @@ jobs:
             binutils \
             desktop-file-utils \
             libfuse2 \
-            gcc
+            gcc \
+            glib-networking \
+            gsettings-desktop-schemas \
+            ca-certificates
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -246,6 +249,38 @@ jobs:
           echo "--- icons fixed ---"
           ls -lh AppDir/.DirIcon AppDir/mini-browser.png
           ls -lh AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png
+          # ---- Bundle TLS support (glib-networking + CA certs) --------------------
+          # Without these HTTPS fails with “TLS support is not available”.
+          mkdir -p AppDir/usr/lib/gio/modules
+          mkdir -p AppDir/usr/share/glib-2.0/schemas
+          mkdir -p AppDir/etc/ssl/certs
+          mkdir -p AppDir/usr/share/p11-kit
+          for moddir in /usr/lib/x86_64-linux-gnu/gio/modules /usr/lib/gio/modules; do
+            if [ -d "$moddir" ]; then
+              cp -av "$moddir"/*.so AppDir/usr/lib/gio/modules/ 2>/dev/null || true
+              cp -av "$moddir"/giomodule.cache AppDir/usr/lib/gio/modules/ 2>/dev/null || true
+            fi
+          done
+          # gio modules + schemas
+          if [ -f /usr/share/glib-2.0/schemas/gschemas.compiled ]; then
+            cp -av /usr/share/glib-2.0/schemas/gschemas.compiled AppDir/usr/share/glib-2.0/schemas/ 2>/dev/null || true
+          fi
+          if [ -d /usr/share/glib-2.0/schemas ]; then
+            cp -av /usr/share/glib-2.0/schemas/*.xml AppDir/usr/share/glib-2.0/schemas/ 2>/dev/null || true
+          fi
+          # CA certificates
+          if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+            cp -av /etc/ssl/certs/ca-certificates.crt AppDir/etc/ssl/certs/ 2>/dev/null || true
+          fi
+          cp -av /etc/ssl/certs/*.pem AppDir/etc/ssl/certs/ 2>/dev/null || true
+          # p11-kit trust
+          if [ -d /usr/share/p11-kit ]; then
+            cp -avr /usr/share/p11-kit AppDir/usr/share/ 2>/dev/null || true
+          fi
+          echo "--- TLS bundled ---"
+          ls -lh AppDir/usr/lib/gio/modules/ 2>&1 | head -20
+          ls -lh AppDir/etc/ssl/certs/ca-certificates.crt 2>&1 | head -5
+          ls -lh AppDir/usr/share/glib-2.0/schemas/gschemas.compiled 2>&1 | head -5
           echo "--- libs bundled ---"
           find AppDir/usr/lib -maxdepth 1 -name '*.so*' | wc -l
 
@@ -266,19 +301,11 @@ jobs:
 
             Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
 
-            ### What's new in v1.0.0 (clean release)
-            - Stable Rust + GTK4 + WebKitGTK 6.0 AppImage — **icon fixed every distro**:
-              `AppDir/.DirIcon` and `AppDir/mini-browser.png` are now real files
-              (not symlinks) plus 16/32/64/128/256 sizes, so Dolphin/Nautilus
-              show the black-ring logo even before desktop integration.
-              Previous type-1 forced AppImages broke file-manager thumbnails.
-            - **Arch/CachyOS/Fedora double-click fixed**: wrapper tests real
-              `unshare --mount` capability (not just `command -v`) and falls back
-              to `LD_PRELOAD` shim (`execve`/`execv`/`execvp`/`execvpe`/`posix_spawn`)
-              when mount-ns is blocked. Before it incorrectly chose `unshare-bind-mount`
-              and failed with `Operation not permitted`.
-            - Bundled WebKit helpers get `$ORIGIN/../..` RPATH + `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`.
-            - AppImage is type-2 (FUSE + fallback) for universal thumbnail support.
+            ### What's new in v1.0.1
+            - **TLS fixed**: bundle `glib-networking` `GIO_MODULE_DIR` + `ca-certificates`/`p11-kit` + `gschemas.compiled` — fixes `TLS support is not available` on Google/search.
+            - **Traffic lights fixed**: `src/window.rs:1018` `background-color` → `background` + `background-image:none` so red/yellow/green dots show inside AppImage (bundled GTK theme overrode `background-color`).
+            - **Dock icon fixed**: `packaging/mini-browser.desktop:12` `StartupWMClass=mini-browser` → `com.example.LightBrowser` matching `src/config.rs:3` `APP_ID`, so dash/dock shows logo not generic.
+            - Icon every distro: real `AppDir/.DirIcon`/`mini-browser.png` + `16/32/64/128/256` hicolor, type-2 AppImage.
 
             ### Install
             Download `Mini-Browser-${{ github.ref_name }}-x86_64.AppImage`, make executable and run:
