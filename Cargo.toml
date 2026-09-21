@@ -1,6 +1,6 @@
 [package]
 name = "light-browser"
-version = "1.4.4"
+version = "1.0.0"
 edition = "2021"
 description = "Lightweight native Linux browser built with Rust + GTK4 + WebKitGTK 6.0"
 authors = ["Mini Browser Contributors"]

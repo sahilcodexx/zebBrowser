@@ -227,6 +227,25 @@ jobs:
           chmod +x AppDir/AppRun
           echo "--- AppRun installed ---"
           head -5 AppDir/AppRun
+          # ---- Fix icon for AppImage file thumbnail (every distro) ----------
+          # linuxdeploy creates .DirIcon/mini-browser.png as symlinks to
+          # hicolor/256x256 which some file managers (Dolphin/Nautilus
+          # thumbd) don't follow when the AppImage is type-1 or when
+          # thumbnailing without FUSE. Copy real files so the icon shows
+          # even before integration, on all DEs.
+          cp -f AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png AppDir/.DirIcon
+          cp -f AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png AppDir/mini-browser.png
+          # Provide additional sizes for HiDPI / older DEs
+          for sz in 16 32 64 128 256; do
+            mkdir -p "AppDir/usr/share/icons/hicolor/${sz}x${sz}/apps"
+            if [ "$sz" != "256" ]; then
+              convert packaging/mini-browser-256.png -resize "${sz}x${sz}" "AppDir/usr/share/icons/hicolor/${sz}x${sz}/apps/mini-browser.png" 2>/dev/null || \
+                cp AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png "AppDir/usr/share/icons/hicolor/${sz}x${sz}/apps/mini-browser.png"
+            fi
+          done
+          echo "--- icons fixed ---"
+          ls -lh AppDir/.DirIcon AppDir/mini-browser.png
+          ls -lh AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png
           echo "--- libs bundled ---"
           find AppDir/usr/lib -maxdepth 1 -name '*.so*' | wc -l
 
@@ -238,38 +257,6 @@ jobs:
             "Mini-Browser-${GITHUB_REF_NAME}-x86_64.AppImage"
           ls -lh Mini-Browser-*.AppImage
 
-      - name: Force type-1 AppImage (no FUSE dependency)
-        # appimagetool emits type-2 AppImages, which try to mount via FUSE first
-        # and only fall back to extract-and-run when FUSE is unavailable.
-        # On some desktops the FUSE call hangs or fails silently when the
-        # AppImage is double-clicked from a file manager — the user sees
-        # "nothing happens". Forcing type-1 makes the runtime extract the
-        # AppImage to a temp dir and exec AppRun directly, eliminating FUSE
-        # from the launch path entirely.
-        #
-        # Magic layout at offset 8 in the AppImage header:
-        #   type-1:  41 49 01  ("AI" + version 1)
-        #   type-2:  41 49 02  ("AI" + version 2)
-        # We overwrite byte 10 from 0x02 to 0x01.
-        run: |
-          set -e
-          APPIMAGE=$(ls Mini-Browser-*-x86_64.AppImage | head -1)
-          # Verify the magic before patching so we fail loudly if appimagetool
-          # changed its layout in a future release.
-          CURRENT=$(dd if="$APPIMAGE" bs=1 skip=10 count=1 2>/dev/null | xxd -p)
-          echo "Current type byte: 0x$CURRENT"
-          if [ "$CURRENT" = "02" ]; then
-            printf '\x01' | dd of="$APPIMAGE" bs=1 seek=10 count=1 conv=notrunc status=none
-            NEW=$(dd if="$APPIMAGE" bs=1 skip=10 count=1 2>/dev/null | xxd -p)
-            echo "Patched type byte: 0x$NEW (forced type-1)"
-            file "$APPIMAGE"
-          elif [ "$CURRENT" = "01" ]; then
-            echo "Already type-1, nothing to do."
-          else
-            echo "Unexpected type byte 0x$CURRENT — appimagetool layout may have changed. Skipping patch."
-            exit 1
-          fi
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -279,28 +266,19 @@ jobs:
 
             Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
 
-            ### What's new in v1.4.3
-            - **Fixes silent launch on non-Debian hosts** (Arch, Fedora, openSUSE,
-              CachyOS, …). v1.4.2 still failed on these because:
-              1. The published LD_PRELOAD shim only exported `execve`; WebKitGTK 6
-                 actually uses `posix_spawn`, so the shim never fired.
-              2. The bundled helpers had no RPATH, so once they were launched they
-                 crashed with `error while loading shared libraries:
-                 libicudata.so.74`.
-              3. WebKitGTK 6 tries to sandbox helpers via `/usr/bin/bwrap`; on
-                 hosts without bwrap (or where the AppDir isn't visible inside
-                 the sandbox) this fails silently.
-            - The shim now exports all five symbols (`execve`, `execv`, `execvp`,
-              `execvpe`, `posix_spawn`) — the build fails loudly if any are
-              dropped by the compiler.
-            - The helper binaries get `$ORIGIN/../..` RPATH so they find the
-              bundled libraries.
-            - The wrapper sets `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`
-              so WebKit skips bwrap and launches helpers directly.
-            - `AppRun` is a wrapper script that logs a diagnostic file
-              (`~/.local/share/mini-browser/launch.log`) for file-manager
-              launches.
-            - AppImage is type-1 (extract-and-run, no FUSE required).
+            ### What's new in v1.0.0 (clean release)
+            - Stable Rust + GTK4 + WebKitGTK 6.0 AppImage — **icon fixed every distro**:
+              `AppDir/.DirIcon` and `AppDir/mini-browser.png` are now real files
+              (not symlinks) plus 16/32/64/128/256 sizes, so Dolphin/Nautilus
+              show the black-ring logo even before desktop integration.
+              Previous type-1 forced AppImages broke file-manager thumbnails.
+            - **Arch/CachyOS/Fedora double-click fixed**: wrapper tests real
+              `unshare --mount` capability (not just `command -v`) and falls back
+              to `LD_PRELOAD` shim (`execve`/`execv`/`execvp`/`execvpe`/`posix_spawn`)
+              when mount-ns is blocked. Before it incorrectly chose `unshare-bind-mount`
+              and failed with `Operation not permitted`.
+            - Bundled WebKit helpers get `$ORIGIN/../..` RPATH + `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`.
+            - AppImage is type-2 (FUSE + fallback) for universal thumbnail support.
 
             ### Install
             Download `Mini-Browser-${{ github.ref_name }}-x86_64.AppImage`, make executable and run:
@@ -309,9 +287,7 @@ jobs:
             ./Mini-Browser-*.AppImage
             ```
 
-            If the window does not appear, run from a terminal and share the
-            output. The wrapper also writes a log to
-            `~/.local/share/mini-browser/launch.log` for offline debugging.
+            If double-click shows nothing, run from terminal or check `~/.local/share/mini-browser/launch.log`.
           files: Mini-Browser-${{ github.ref_name }}-x86_64.AppImage
           draft: false
           prerelease: false
