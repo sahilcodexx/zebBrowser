@@ -9,5 +9,5 @@ Type=Application
 Categories=Network;WebBrowser;
 MimeType=text/html;text/xml;application/xhtml+xml;application/xml;application/rss+xml;x-scheme-handler/http;x-scheme-handler/https;
 StartupNotify=true
-StartupWMClass=mini-browser
+StartupWMClass=com.example.LightBrowser
 Keywords=browser;web;internet;

@@ -38,7 +38,18 @@ jobs:
             binutils \
             desktop-file-utils \
             libfuse2 \
-            gcc
+            gcc \
+            glib-networking \
+            gsettings-desktop-schemas \
+            ca-certificates \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav \
+            gstreamer1.0-gl \
+            gstreamer1.0-alsa \
+            gstreamer1.0-pulseaudio \
+            gstreamer1.0-x
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -159,15 +170,21 @@ jobs:
           # matching AppDir path. The LD_PRELOAD shim built below rewrites
           # the spawn path so this AppDir copy is used on hosts that lack
           # the system path.
-          mkdir -p AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0
-          if [ -d /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 ]; then
-              cp -a /usr/lib/x86_64-linux-gnu/webkitgtk-6.0/. \
-                  AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/
-              echo "bundled helpers:"
-              ls AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/
-          else
-              echo "WARNING: /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 not found on runner"
+          mkdir -p AppDir/w
+          for helper_dir in \
+              /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 \
+              /usr/lib/webkitgtk-6.0 \
+              /usr/lib64/webkitgtk-6.0; do
+              if [ -d "$helper_dir" ]; then
+                  cp -a "$helper_dir"/. AppDir/w/
+              fi
+          done
+          if [ ! -x AppDir/w/WebKitNetworkProcess ]; then
+              echo "FATAL: WebKitGTK 6 helper binaries were not found on runner" >&2
+              exit 1
           fi
+          echo "bundled WebKit helpers:"
+          ls AppDir/w/
 
           # ---- Patch RPATH on the helper binaries ---------------------------
           # The helpers ship without an RPATH, so when the LD_PRELOAD shim
@@ -180,15 +197,51 @@ jobs:
           #   $APPDIR/usr/lib/<lib>
           # so $ORIGIN/../.. resolves from the helper to the lib dir.
           for helper in \
-              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitNetworkProcess \
-              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitWebProcess \
-              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitGPUProcess \
-              AppDir/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/MiniBrowser; do
+              AppDir/w/WebKitNetworkProcess \
+              AppDir/w/WebKitWebProcess \
+              AppDir/w/WebKitGPUProcess \
+              AppDir/w/MiniBrowser; do
               if [ -f "$helper" ]; then
-                  patchelf --set-rpath '$ORIGIN/../..' "$helper"
+                  patchelf --set-rpath '$ORIGIN/../usr/lib' "$helper"
                   echo "patched rpath on $helper -> $(patchelf --print-rpath "$helper")"
               fi
           done
+
+          webkit_found=0
+          for webkit_lib in \
+              AppDir/usr/lib/libwebkitgtk-6.0.so* \
+              AppDir/usr/lib/x86_64-linux-gnu/libwebkitgtk-6.0.so*; do
+              if [ -f "$webkit_lib" ]; then
+                  python3 packaging/relocate-webkit.py "$webkit_lib"
+                  webkit_found=1
+              fi
+          done
+          if [ "$webkit_found" -eq 0 ]; then
+              echo "FATAL: bundled libwebkitgtk-6.0 library was not found" >&2
+              exit 1
+          fi
+          touch AppDir/w/.relocated
+
+          mkdir -p AppDir/usr/lib/gstreamer-1.0
+          for plugin_dir in \
+              /usr/lib/x86_64-linux-gnu/gstreamer-1.0 \
+              /usr/lib/gstreamer-1.0 \
+              /usr/lib64/gstreamer-1.0; do
+              if [ -d "$plugin_dir" ]; then
+                  cp -a "$plugin_dir"/. AppDir/usr/lib/gstreamer-1.0/
+              fi
+          done
+          echo "bundled GStreamer plugins: $(ls AppDir/usr/lib/gstreamer-1.0 | wc -l)"
+
+          mkdir -p AppDir/usr/lib/gdk-pixbuf-2.0
+          for loader_dir in \
+              /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/* \
+              /usr/lib/gdk-pixbuf-2.0/*; do
+              if [ -d "$loader_dir" ]; then
+                  cp -a "$loader_dir" AppDir/usr/lib/gdk-pixbuf-2.0/
+              fi
+          done
+          echo "bundled pixbuf loaders: $(ls AppDir/usr/lib/gdk-pixbuf-2.0 | wc -l)"
 
           # ---- Build the LD_PRELOAD redirect shim --------------------------
           # See packaging/webkit-helper-redirect.c for the full explanation.
@@ -227,6 +280,57 @@ jobs:
           chmod +x AppDir/AppRun
           echo "--- AppRun installed ---"
           head -5 AppDir/AppRun
+          # ---- Fix icon for AppImage file thumbnail (every distro) ----------
+          # linuxdeploy creates .DirIcon/mini-browser.png as symlinks to
+          # hicolor/256x256 which some file managers (Dolphin/Nautilus
+          # thumbd) don't follow. Copy real files so the icon shows
+          # even before integration, on all DEs.
+          rm -f AppDir/.DirIcon AppDir/mini-browser.png
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png AppDir/.DirIcon
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png AppDir/mini-browser.png
+          # Provide additional sizes for HiDPI / older DEs
+          for sz in 16 32 64 128 256; do
+            mkdir -p "AppDir/usr/share/icons/hicolor/${sz}x${sz}/apps"
+            if [ "$sz" != "256" ]; then
+              convert packaging/mini-browser-256.png -resize "${sz}x${sz}" "AppDir/usr/share/icons/hicolor/${sz}x${sz}/apps/mini-browser.png" 2>/dev/null || \
+                cp AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png "AppDir/usr/share/icons/hicolor/${sz}x${sz}/apps/mini-browser.png"
+            fi
+          done
+          echo "--- icons fixed ---"
+          ls -lh AppDir/.DirIcon AppDir/mini-browser.png
+          ls -lh AppDir/usr/share/icons/hicolor/256x256/apps/mini-browser.png
+          # ---- Bundle TLS support (glib-networking + CA certs) --------------------
+          # Without these HTTPS fails with “TLS support is not available”.
+          mkdir -p AppDir/usr/lib/gio/modules
+          mkdir -p AppDir/usr/share/glib-2.0/schemas
+          mkdir -p AppDir/etc/ssl/certs
+          mkdir -p AppDir/usr/share/p11-kit
+          for moddir in /usr/lib/x86_64-linux-gnu/gio/modules /usr/lib/gio/modules; do
+            if [ -d "$moddir" ]; then
+              cp -av "$moddir"/*.so AppDir/usr/lib/gio/modules/ 2>/dev/null || true
+              cp -av "$moddir"/giomodule.cache AppDir/usr/lib/gio/modules/ 2>/dev/null || true
+            fi
+          done
+          # gio modules + schemas
+          if [ -f /usr/share/glib-2.0/schemas/gschemas.compiled ]; then
+            cp -av /usr/share/glib-2.0/schemas/gschemas.compiled AppDir/usr/share/glib-2.0/schemas/ 2>/dev/null || true
+          fi
+          if [ -d /usr/share/glib-2.0/schemas ]; then
+            cp -av /usr/share/glib-2.0/schemas/*.xml AppDir/usr/share/glib-2.0/schemas/ 2>/dev/null || true
+          fi
+          # CA certificates
+          if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+            cp -av /etc/ssl/certs/ca-certificates.crt AppDir/etc/ssl/certs/ 2>/dev/null || true
+          fi
+          cp -av /etc/ssl/certs/*.pem AppDir/etc/ssl/certs/ 2>/dev/null || true
+          # p11-kit trust
+          if [ -d /usr/share/p11-kit ]; then
+            cp -avr /usr/share/p11-kit AppDir/usr/share/ 2>/dev/null || true
+          fi
+          echo "--- TLS bundled ---"
+          ls -lh AppDir/usr/lib/gio/modules/ 2>&1 | head -20
+          ls -lh AppDir/etc/ssl/certs/ca-certificates.crt 2>&1 | head -5
+          ls -lh AppDir/usr/share/glib-2.0/schemas/gschemas.compiled 2>&1 | head -5
           echo "--- libs bundled ---"
           find AppDir/usr/lib -maxdepth 1 -name '*.so*' | wc -l
 
@@ -238,38 +342,6 @@ jobs:
             "Mini-Browser-${GITHUB_REF_NAME}-x86_64.AppImage"
           ls -lh Mini-Browser-*.AppImage
 
-      - name: Force type-1 AppImage (no FUSE dependency)
-        # appimagetool emits type-2 AppImages, which try to mount via FUSE first
-        # and only fall back to extract-and-run when FUSE is unavailable.
-        # On some desktops the FUSE call hangs or fails silently when the
-        # AppImage is double-clicked from a file manager — the user sees
-        # "nothing happens". Forcing type-1 makes the runtime extract the
-        # AppImage to a temp dir and exec AppRun directly, eliminating FUSE
-        # from the launch path entirely.
-        #
-        # Magic layout at offset 8 in the AppImage header:
-        #   type-1:  41 49 01  ("AI" + version 1)
-        #   type-2:  41 49 02  ("AI" + version 2)
-        # We overwrite byte 10 from 0x02 to 0x01.
-        run: |
-          set -e
-          APPIMAGE=$(ls Mini-Browser-*-x86_64.AppImage | head -1)
-          # Verify the magic before patching so we fail loudly if appimagetool
-          # changed its layout in a future release.
-          CURRENT=$(dd if="$APPIMAGE" bs=1 skip=10 count=1 2>/dev/null | xxd -p)
-          echo "Current type byte: 0x$CURRENT"
-          if [ "$CURRENT" = "02" ]; then
-            printf '\x01' | dd of="$APPIMAGE" bs=1 seek=10 count=1 conv=notrunc status=none
-            NEW=$(dd if="$APPIMAGE" bs=1 skip=10 count=1 2>/dev/null | xxd -p)
-            echo "Patched type byte: 0x$NEW (forced type-1)"
-            file "$APPIMAGE"
-          elif [ "$CURRENT" = "01" ]; then
-            echo "Already type-1, nothing to do."
-          else
-            echo "Unexpected type byte 0x$CURRENT — appimagetool layout may have changed. Skipping patch."
-            exit 1
-          fi
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -279,28 +351,11 @@ jobs:
 
             Zen-inspired GTK4 browser built with Rust + WebKitGTK 6.
 
-            ### What's new in v1.4.3
-            - **Fixes silent launch on non-Debian hosts** (Arch, Fedora, openSUSE,
-              CachyOS, …). v1.4.2 still failed on these because:
-              1. The published LD_PRELOAD shim only exported `execve`; WebKitGTK 6
-                 actually uses `posix_spawn`, so the shim never fired.
-              2. The bundled helpers had no RPATH, so once they were launched they
-                 crashed with `error while loading shared libraries:
-                 libicudata.so.74`.
-              3. WebKitGTK 6 tries to sandbox helpers via `/usr/bin/bwrap`; on
-                 hosts without bwrap (or where the AppDir isn't visible inside
-                 the sandbox) this fails silently.
-            - The shim now exports all five symbols (`execve`, `execv`, `execvp`,
-              `execvpe`, `posix_spawn`) — the build fails loudly if any are
-              dropped by the compiler.
-            - The helper binaries get `$ORIGIN/../..` RPATH so they find the
-              bundled libraries.
-            - The wrapper sets `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`
-              so WebKit skips bwrap and launches helpers directly.
-            - `AppRun` is a wrapper script that logs a diagnostic file
-              (`~/.local/share/mini-browser/launch.log`) for file-manager
-              launches.
-            - AppImage is type-1 (extract-and-run, no FUSE required).
+            ### What's new in v1.0.1
+            - **TLS fixed**: bundle `glib-networking` `GIO_MODULE_DIR` + `ca-certificates`/`p11-kit` + `gschemas.compiled` — fixes `TLS support is not available` on Google/search.
+            - **Traffic lights fixed**: `src/window.rs:1018` `background-color` → `background` + `background-image:none` so red/yellow/green dots show inside AppImage (bundled GTK theme overrode `background-color`).
+            - **Dock icon fixed**: `packaging/mini-browser.desktop:12` `StartupWMClass=mini-browser` → `com.example.LightBrowser` matching `src/config.rs:3` `APP_ID`, so dash/dock shows logo not generic.
+            - Icon every distro: real `AppDir/.DirIcon`/`mini-browser.png` + `16/32/64/128/256` hicolor, type-2 AppImage.
 
             ### Install
             Download `Mini-Browser-${{ github.ref_name }}-x86_64.AppImage`, make executable and run:
@@ -309,9 +364,7 @@ jobs:
             ./Mini-Browser-*.AppImage
             ```
 
-            If the window does not appear, run from a terminal and share the
-            output. The wrapper also writes a log to
-            `~/.local/share/mini-browser/launch.log` for offline debugging.
+            If double-click shows nothing, run from terminal or check `~/.local/share/mini-browser/launch.log`.
           files: Mini-Browser-${{ github.ref_name }}-x86_64.AppImage
           draft: false
           prerelease: false

@@ -28,6 +28,19 @@ pub const NEW_TAB_HTML: &str = r#"<!DOCTYPE html>
     --line-soft: rgba(0,0,0,0.06);
     --shadow: 0 18px 40px rgba(0,0,0,0.08), 0 2px 10px rgba(0,0,0,0.04);
   }
+  :root.dark, html.dark {
+    color-scheme: dark;
+    --bg: #141416;
+    --bg-elev: #1e1e24;
+    --fg: #f5f5f7;
+    --muted: #8e8e93;
+    --line: rgba(255,255,255,0.12);
+    --line-soft: rgba(255,255,255,0.08);
+    --shadow: 0 18px 40px rgba(0,0,0,0.40), 0 2px 10px rgba(0,0,0,0.20);
+  }
+  :root.dark .suggestion strong, html.dark .suggestion strong { color: #f5f5f7; }
+  :root.dark .search input::selection, html.dark .search input::selection { background: #2b4c7e; }
+  :root.dark .search.focused, html.dark .search.focused { border-color: rgba(255,255,255,0.28); }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
                font-family: -apple-system, system-ui, "Segoe UI", Roboto, "Helvetica Neue",
                             Arial, sans-serif; }
@@ -105,6 +118,15 @@ pub const NEW_TAB_HTML: &str = r#"<!DOCTYPE html>
   </form>
   <script>
     (function () {
+      function applyTheme() {
+        if (window.location.hash === '#dark') {
+          document.documentElement.classList.add('dark');
+        } else if (window.location.hash === '#light') {
+          document.documentElement.classList.remove('dark');
+        }
+      }
+      applyTheme();
+      window.addEventListener('hashchange', applyTheme);
       var input = document.getElementById('q');
       var form = document.getElementById('f');
 

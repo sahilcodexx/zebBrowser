@@ -83,6 +83,7 @@ static const char *base_name(const char *path) {
  * NULL when no redirect should happen. */
 static const char *maybe_redirect(const char *pathname) {
     if (!pathname || pathname[0] != '/') return NULL;
+    if (access(pathname, X_OK) == 0)     return NULL;
     if (!appdir_helpers[0])             return NULL;
     /* Match the Debian-style multiarch helper location. We don't try to be
      * clever about matching the exact helper name — any absolute path
@@ -102,7 +103,11 @@ static void __attribute__((constructor)) init(void) {
     const char *appdir = getenv("APPDIR");
     if (appdir && *appdir) {
         snprintf(appdir_helpers, sizeof(appdir_helpers),
-                 "%s/usr/lib/x86_64-linux-gnu/webkitgtk-6.0", appdir);
+                 "%s/w", appdir);
+        if (access(appdir_helpers, F_OK) != 0) {
+            snprintf(appdir_helpers, sizeof(appdir_helpers),
+                     "%s/usr/lib/x86_64-linux-gnu/webkitgtk-6.0", appdir);
+        }
     } else {
         appdir_helpers[0] = '\0';
     }
@@ -131,7 +136,7 @@ int execv(const char *pathname, char *const argv[]) {
     const char *r = maybe_redirect(pathname);
     if (r) {
         dbg("  -> redirecting to %s", r);
-        return real_execve(r, argv, environ);
+        return real_execv(r, argv);
     }
     return real_execv(pathname, argv);
 }
@@ -176,7 +181,7 @@ int posix_spawn(pid_t *pid, const char *path,
     const char *r = maybe_redirect(path);
     if (r) {
         dbg("  -> redirecting to %s", r);
-        return real_posix_spawn(pid, r, file_actions, attrp, argv, environ);
+        return real_posix_spawn(pid, r, file_actions, attrp, argv, envp);
     }
     return real_posix_spawn(pid, path, file_actions, attrp, argv, envp);
 }
