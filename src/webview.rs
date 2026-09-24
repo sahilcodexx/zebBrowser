@@ -33,6 +33,15 @@ impl WebView {
             ffi::webkit_settings_set_javascript_can_open_windows_automatically(settings, 1);
             ffi::webkit_settings_set_enable_smooth_scrolling(settings, 1);
             ffi::webkit_settings_set_enable_media(settings, 1);
+            ffi::webkit_settings_set_enable_webgl(settings, 1);
+            ffi::webkit_settings_set_enable_webaudio(settings, 1);
+            ffi::webkit_settings_set_enable_mediasource(settings, 1);
+            ffi::webkit_settings_set_enable_media_capabilities(settings, 1);
+            ffi::webkit_settings_set_enable_media_stream(settings, 1);
+            ffi::webkit_settings_set_media_playback_requires_user_gesture(settings, 0);
+            ffi::webkit_settings_set_media_playback_allows_inline(settings, 1);
+            ffi::webkit_settings_set_enable_developer_extras(settings, 1);
+            ffi::webkit_settings_set_enable_write_console_messages_to_stdout(settings, 1);
         }
 
         let raw = unsafe { ffi::webkit_web_view_new() };
@@ -102,6 +111,26 @@ impl WebView {
         } else {
             let s = unsafe { std::ffi::CStr::from_ptr(p) };
             Some(s.to_string_lossy().into_owned())
+        }
+    }
+
+    /// Run JavaScript on the current page.
+    pub fn evaluate_javascript(&self, script: &str) {
+        let c = match CString::new(script) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        unsafe {
+            ffi::webkit_web_view_evaluate_javascript(
+                self.web_view_ptr(),
+                c.as_ptr(),
+                -1,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+            );
         }
     }
 

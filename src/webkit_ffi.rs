@@ -4,6 +4,7 @@
 //! by the browser MVP.
 
 #![allow(non_camel_case_types)]
+#![allow(dead_code)]
 
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
@@ -50,6 +51,16 @@ extern "C" {
         web_view: *mut WebKitWebView,
         settings: *mut WebKitSettings,
     );
+    pub fn webkit_web_view_evaluate_javascript(
+        web_view: *mut WebKitWebView,
+        script: *const c_char,
+        length: isize,
+        world_name: *const c_char,
+        source_uri: *const c_char,
+        cancellable: *mut c_void,
+        callback: Option<unsafe extern "C" fn()>,
+        user_data: *mut c_void,
+    );
 
     // ----- WebKitSettings -----
     pub fn webkit_settings_new() -> *mut WebKitSettings;
@@ -64,6 +75,30 @@ extern "C" {
     );
     pub fn webkit_settings_set_auto_load_images(settings: *mut WebKitSettings, enabled: c_int);
     pub fn webkit_settings_set_enable_media(settings: *mut WebKitSettings, enabled: c_int);
+    pub fn webkit_settings_set_enable_webgl(settings: *mut WebKitSettings, enabled: c_int);
+    pub fn webkit_settings_set_enable_webaudio(settings: *mut WebKitSettings, enabled: c_int);
+    pub fn webkit_settings_set_enable_mediasource(settings: *mut WebKitSettings, enabled: c_int);
+    pub fn webkit_settings_set_enable_media_capabilities(
+        settings: *mut WebKitSettings,
+        enabled: c_int,
+    );
+    pub fn webkit_settings_set_enable_media_stream(settings: *mut WebKitSettings, enabled: c_int);
+    pub fn webkit_settings_set_media_playback_requires_user_gesture(
+        settings: *mut WebKitSettings,
+        required: c_int,
+    );
+    pub fn webkit_settings_set_media_playback_allows_inline(
+        settings: *mut WebKitSettings,
+        allowed: c_int,
+    );
+    pub fn webkit_settings_set_enable_developer_extras(
+        settings: *mut WebKitSettings,
+        enabled: c_int,
+    );
+    pub fn webkit_settings_set_enable_write_console_messages_to_stdout(
+        settings: *mut WebKitSettings,
+        enabled: c_int,
+    );
 
     // ----- GObject -----
     pub fn g_object_unref(obj: *mut GObject);
