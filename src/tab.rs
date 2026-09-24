@@ -132,7 +132,7 @@ impl Tab {
         });
     }
 
-    pub fn load_new_tab_page(&self) {
+    pub fn load_new_tab_page(&self, dark: bool) {
         let html = config::NEW_TAB_HTML;
         // Encode the HTML as a data URL; WebKit reliably navigates these.
         let mut data = String::with_capacity(html.len() * 3 + 64);
@@ -164,10 +164,25 @@ impl Tab {
                 _ => data.push_str(&format!("%{:02X}", b)),
             }
         }
+        if dark {
+            data.push_str("#dark");
+        } else {
+            data.push_str("#light");
+        }
         let c = std::ffi::CString::new(data).unwrap_or_default();
         unsafe {
             ffi::webkit_web_view_load_uri(self.webview.web_view_ptr(), c.as_ptr());
         }
+    }
+
+    /// Dynamically update theme on the new-tab page via JS without full-page navigation.
+    pub fn update_theme(&self, dark: bool) {
+        let js = if dark {
+            "document.documentElement.classList.add('dark'); try { window.location.hash = '#dark'; } catch(e){}"
+        } else {
+            "document.documentElement.classList.remove('dark'); try { window.location.hash = '#light'; } catch(e){}"
+        };
+        self.webview.evaluate_javascript(js);
     }
 
     pub fn navigate(&self, input: &str) {
@@ -186,7 +201,7 @@ impl Tab {
         }
         // Don't navigate to internal "about:newtab" — instead re-render.
         if uri == "about:newtab" {
-            self.load_new_tab_page();
+            self.load_new_tab_page(false);
             return;
         }
         *self.url.borrow_mut() = uri.to_string();
