@@ -112,8 +112,8 @@ pub const NEW_TAB_HTML: &str = r#"<!DOCTYPE html>
         <circle cx="11" cy="11" r="7"></circle>
         <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
       </svg>
-      <span class="kbd">G</span>
-      <span>Search with Google</span>
+      <span class="kbd">D</span>
+      <span>Search with DuckDuckGo</span>
     </div>
   </form>
   <script>
@@ -149,7 +149,7 @@ pub const NEW_TAB_HTML: &str = r#"<!DOCTYPE html>
         if (looksLikeUrl(v)) {
           window.location.href = fullUrl(v);
         } else {
-          window.location.href = 'https://www.google.com/search?q=' + encodeURIComponent(v);
+          window.location.href = 'https://duckduckgo.com/?q=' + encodeURIComponent(v);
         }
       }
 
@@ -170,7 +170,7 @@ pub const NEW_TAB_HTML: &str = r#"<!DOCTYPE html>
               [host + '/search', 'Search on this site']
             ]
           : [
-              [v, 'Google Search'],
+              [v, 'DuckDuckGo Search'],
               [v + ' docs', 'Search suggestion'],
               [v + ' examples', 'Search suggestion']
             ];
