@@ -93,8 +93,6 @@ struct TabRow {
     favicon_stack: gtk4::Stack,
     has_icon: Cell<bool>,
     tab: Weak<Tab>,
-    #[allow(dead_code)]
-    pin_btn: Button,
 }
 
 impl BrowserWindow {
@@ -273,15 +271,6 @@ impl BrowserWindow {
         sidebar_traffic.append(&sidebar_zoom_dot);
         sidebar_header.append(&sidebar_traffic);
 
-        let sidebar_title = Label::new(Some("Personal"));
-        sidebar_title.set_css_classes(&["sidebar-title"]);
-        sidebar_header.append(&sidebar_title);
-
-        let sidebar_download = Button::from_icon_name("folder-download-symbolic");
-        sidebar_download.set_tooltip_text(Some("Downloads"));
-        sidebar_download.set_focus_on_click(false);
-        sidebar_download.set_css_classes(&["sidebar-download"]);
-        sidebar_header.append(&sidebar_download);
         sidebar.append(&sidebar_header);
 
         let sidebar_address = gtk4::Entry::new();
@@ -296,7 +285,7 @@ impl BrowserWindow {
         sidebar_address.set_css_classes(&["urlbar", "sidebar-urlbar"]);
         sidebar.append(&sidebar_address);
 
-        let sidebar_content = GtkBox::new(Orientation::Vertical, 8);
+        let sidebar_content = GtkBox::new(Orientation::Vertical, 4);
         sidebar_content.set_css_classes(&["sidebar-content"]);
         sidebar_content.set_vexpand(true);
         sidebar_content.set_hexpand(true);
@@ -306,7 +295,7 @@ impl BrowserWindow {
         sidebar_pinned_label.set_xalign(0.0);
         sidebar_content.append(&sidebar_pinned_label);
 
-        let sidebar_pinned_tabs = GtkBox::new(Orientation::Vertical, 6);
+        let sidebar_pinned_tabs = GtkBox::new(Orientation::Vertical, 2);
         sidebar_pinned_tabs.set_css_classes(&["sidebar-pinned-tabs"]);
         sidebar_pinned_tabs.set_hexpand(true);
         sidebar_content.append(&sidebar_pinned_tabs);
@@ -316,30 +305,60 @@ impl BrowserWindow {
         sidebar_tabs_label.set_xalign(0.0);
         sidebar_content.append(&sidebar_tabs_label);
 
-        let sidebar_tabs = GtkBox::new(Orientation::Vertical, 6);
+        let sidebar_tabs = GtkBox::new(Orientation::Vertical, 2);
         sidebar_tabs.set_css_classes(&["sidebar-tabs"]);
         sidebar_tabs.set_hexpand(true);
-        sidebar_content.append(&sidebar_tabs);
-
-        let sidebar_new_tab_btn = Button::from_icon_name("list-add-symbolic");
+        let sidebar_new_tab_btn = Button::new();
         sidebar_new_tab_btn.set_tooltip_text(Some("New Tab (Ctrl+T)"));
         sidebar_new_tab_btn.set_focus_on_click(false);
-        sidebar_new_tab_btn.set_halign(gtk4::Align::Start);
-        sidebar_new_tab_btn.set_hexpand(false);
+        sidebar_new_tab_btn.set_halign(gtk4::Align::Fill);
+        sidebar_new_tab_btn.set_hexpand(true);
         sidebar_new_tab_btn.set_css_classes(&["sidebar-new-tab-btn"]);
+        let new_tab_inner = GtkBox::new(Orientation::Horizontal, 8);
+        let new_tab_icon = gtk4::Image::from_icon_name("list-add-symbolic");
+        let new_tab_label = Label::new(Some("New Tab"));
+        new_tab_label.set_xalign(0.0);
+        new_tab_label.set_hexpand(true);
+        new_tab_inner.append(&new_tab_icon);
+        new_tab_inner.append(&new_tab_label);
+        sidebar_new_tab_btn.set_child(Some(&new_tab_inner));
         sidebar_content.append(&sidebar_new_tab_btn);
+
+        sidebar_content.append(&sidebar_tabs);
         sidebar.append(&sidebar_content);
 
-        let sidebar_bottom = GtkBox::new(Orientation::Horizontal, 0);
+        let sidebar_bottom = GtkBox::new(Orientation::Horizontal, 4);
         sidebar_bottom.set_css_classes(&["sidebar-bottom"]);
-        sidebar_bottom.set_halign(gtk4::Align::Start);
         sidebar_bottom.set_valign(gtk4::Align::End);
+        sidebar_bottom.set_hexpand(true);
+
+        // Workspace pill (left)
+        let workspace_pill = Button::new();
+        let pill_inner = GtkBox::new(Orientation::Horizontal, 6);
+        let pill_label = Label::new(Some("Personal"));
+        pill_inner.append(&pill_label);
+        workspace_pill.set_child(Some(&pill_inner));
+        workspace_pill.set_tooltip_text(Some("Personal workspace"));
+        workspace_pill.set_focus_on_click(false);
+        workspace_pill.set_css_classes(&["sidebar-workspace-pill"]);
+
+        let download_btn = Button::from_icon_name("folder-download-symbolic");
+        download_btn.set_tooltip_text(Some("Downloads"));
+        download_btn.set_focus_on_click(false);
+        download_btn.set_css_classes(&["sidebar-icon-btn"]);
 
         let settings_btn = Button::from_icon_name("emblem-system-symbolic");
         settings_btn.set_size_request(28, 28);
         settings_btn.set_tooltip_text(Some("Settings"));
         settings_btn.set_focus_on_click(false);
         settings_btn.set_css_classes(&["sidebar-settings-btn"]);
+
+        let bottom_spacer = GtkBox::new(Orientation::Horizontal, 0);
+        bottom_spacer.set_hexpand(true);
+
+        sidebar_bottom.append(&workspace_pill);
+        sidebar_bottom.append(&bottom_spacer);
+        sidebar_bottom.append(&download_btn);
         sidebar_bottom.append(&settings_btn);
 
         sidebar.append(&sidebar_bottom);
@@ -712,7 +731,6 @@ impl BrowserWindow {
                 row.container.set_width_request(0);
                 row.title_label.set_xalign(0.0);
                 row.close_btn.set_visible(true);
-                row.pin_btn.set_visible(false);
                 if is_pinned {
                     row.container.add_css_class("sidebar-pinned-tab-row");
                     self.sidebar_pinned_tabs.append(&row.container);
@@ -739,7 +757,6 @@ impl BrowserWindow {
                     row.title_label.set_xalign(0.0);
                     row.close_btn.set_visible(true);
                 }
-                row.pin_btn.set_visible(false);
                 if let Some(tab) = row.tab.upgrade() {
                     row.title_label
                         .set_text(&self.tab_label_for(&tab, is_pinned));
@@ -1347,13 +1364,6 @@ impl TabRow {
         container.set_hexpand(false);
         container.set_width_request(120);
 
-        let pin_btn = Button::from_icon_name("pin-symbolic");
-        pin_btn.set_tooltip_text(Some("Pin (Ctrl+P)"));
-        pin_btn.set_css_classes(&["tab-pin"]);
-        pin_btn.set_focus_on_click(false);
-        pin_btn.set_visible(false);
-        container.append(&pin_btn);
-
         // Favicon slot: real site icon when available, colored letter tile otherwise.
         let favicon_letter = Label::new(Some("N"));
         favicon_letter.set_css_classes(&["tab-favicon", "fav-c0"]);
@@ -1444,32 +1454,6 @@ impl TabRow {
             }
         });
 
-        // Pin button (visible on hover / always when pinned).
-        let win_weak = Rc::downgrade(window);
-        let tab_weak = Rc::downgrade(&tab);
-        pin_btn.connect_clicked(move |_| {
-            if let (Some(_win), Some(tab)) = (win_weak.upgrade(), tab_weak.upgrade()) {
-                tab.toggle_pinned();
-            }
-        });
-
-        // Hover: show pin button when not pinned.
-        let motion = gtk4::EventControllerMotion::new();
-        let pin_weak_for_show = pin_btn.clone();
-        motion.connect_enter(move |_, _, _| {
-            pin_weak_for_show.set_visible(true);
-        });
-        let pin_weak_for_hide = pin_btn.clone();
-        let tab_weak_for_hide = Rc::downgrade(&tab);
-        motion.connect_leave(move |_| {
-            if let Some(t) = tab_weak_for_hide.upgrade() {
-                if !t.pinned.get() {
-                    pin_weak_for_hide.set_visible(false);
-                }
-            }
-        });
-        container.add_controller(motion);
-
         let row = Rc::new(Self {
             container,
             title_label,
@@ -1479,7 +1463,6 @@ impl TabRow {
             favicon_stack,
             has_icon: Cell::new(false),
             tab: Rc::downgrade(&tab),
-            pin_btn,
         });
         row.update_favicon(&tab);
         row
@@ -1699,7 +1682,9 @@ impl BrowserWindow {
         page_title_label.set_xalign(0.0);
 
         let close_dialog_btn = Button::from_icon_name("window-close-symbolic");
-        close_dialog_btn.set_size_request(28, 28);
+        close_dialog_btn.set_size_request(30, 30);
+        close_dialog_btn.set_valign(gtk4::Align::Center);
+        close_dialog_btn.set_focus_on_click(false);
         close_dialog_btn.set_tooltip_text(Some("Close"));
         close_dialog_btn.set_css_classes(&["settings-modal-close-btn"]);
         let me_weak = self.self_weak.clone();
@@ -2199,35 +2184,62 @@ fn install_css() {
         }
 
         window.dark .sidebar {
-            background-color: #1a1a1e;
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 12px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.40);
+            background-color: #16161b;
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 14px;
+            box-shadow: 0 10px 32px rgba(0,0,0,0.45);
         }
 
         .sidebar-header {
-            min-height: 30px;
-            padding: 2px 4px 8px;
+            min-height: 34px;
+            padding: 4px 2px 12px;
         }
 
         .sidebar-title {
-            font-size: 14px;
+            font-size: 13.5px;
             font-weight: 700;
+            letter-spacing: 0.2px;
             color: #1c1c1e;
         }
 
-        .sidebar-download {
+        /* Zen-style bottom bar */
+        .sidebar-workspace-pill {
+            min-height: 28px;
+            padding: 4px 12px;
+            border: 0;
+            border-radius: 8px;
+            color: #475569;
+            background: transparent;
+            background-image: none;
+            box-shadow: none;
+            font-size: 12.5px;
+            font-weight: 700;
+        }
+
+        .sidebar-workspace-pill label {
+            color: inherit;
+            font-size: inherit;
+            font-weight: inherit;
+        }
+
+        .sidebar-workspace-pill:hover {
+            background: rgba(0,0,0,0.06);
+            color: #1c1c1e;
+        }
+
+        .sidebar-icon-btn {
             min-width: 28px;
             min-height: 28px;
             padding: 4px;
-            margin-left: auto;
             border: 0;
-            border-radius: 8px;
+            border-radius: 7px;
             color: #64748b;
             background: transparent;
+            background-image: none;
+            box-shadow: none;
         }
 
-        .sidebar-download:hover {
+        .sidebar-icon-btn:hover {
             color: #1c1c1e;
             background: rgba(0,0,0,0.07);
         }
@@ -2250,14 +2262,14 @@ fn install_css() {
         .fav-c5 { background-color: #8b5cf6; }
 
         .sidebar-content {
-            padding: 2px 0 0;
+            padding: 0 0 4px;
         }
 
         .sidebar-section-label {
             font-size: 10.5px;
             font-weight: 700;
             color: #64748b;
-            margin: 2px 4px 0;
+            margin: 6px 8px 2px;
             letter-spacing: 0.4px;
         }
 
@@ -2268,30 +2280,28 @@ fn install_css() {
 
         .sidebar-tab-row,
         .sidebar-pinned-tab-row {
-            min-height: 42px;
+            min-height: 34px;
             min-width: 0;
-            padding: 8px 10px;
-            border-radius: 10px;
-            border: 1px solid rgba(60,60,67,0.08);
-            background: rgba(255,255,255,0.58);
+            padding: 5px 8px;
+            border-radius: 8px;
+            border: 0;
+            background: transparent;
             color: #334155;
         }
 
         .sidebar-pinned-tab-row {
-            min-height: 48px;
+            min-height: 34px;
         }
 
         .sidebar-tab-row:hover,
         .sidebar-pinned-tab-row:hover {
-            background: rgba(255,255,255,0.90);
-            border-color: rgba(60,60,67,0.14);
+            background: rgba(0,0,0,0.06);
         }
 
         .sidebar-tab-row.active-tab,
         .sidebar-pinned-tab-row.active-tab {
-            background: #ffffff;
-            border-color: rgba(0,122,255,0.28);
-            box-shadow: 0 2px 8px rgba(15,23,42,0.08);
+            background: rgba(0,0,0,0.09);
+            box-shadow: none;
         }
 
         .sidebar-tab-row label,
@@ -2308,15 +2318,14 @@ fn install_css() {
 
         .sidebar-tab-row .tab-pin,
         .sidebar-pinned-tab-row .tab-pin {
-            min-width: 18px;
-            min-height: 18px;
-            padding: 2px;
+            min-width: 0;
+            min-height: 0;
+            padding: 0;
             opacity: 0;
-        }
-
-        .sidebar-tab-row:hover .tab-pin,
-        .sidebar-pinned-tab-row:hover .tab-pin {
-            opacity: 0.65;
+            background: transparent;
+            background-image: none;
+            border: 0;
+            box-shadow: none;
         }
 
         .sidebar-tab-row .tab-close,
@@ -2326,6 +2335,11 @@ fn install_css() {
             padding: 2px;
             opacity: 0;
             color: #64748b;
+            background: transparent;
+            background-image: none;
+            border: 0;
+            box-shadow: none;
+            border-radius: 999px;
         }
 
         .sidebar-tab-row:hover .tab-close,
@@ -2336,30 +2350,51 @@ fn install_css() {
         }
 
         .sidebar-new-tab-btn {
-            min-width: 30px;
-            min-height: 30px;
-            margin-top: 4px;
-            padding: 5px;
-            border: 1px solid rgba(60,60,67,0.10);
+            min-height: 34px;
+            margin-top: 2px;
+            padding: 6px 10px;
+            border: 0;
             border-radius: 8px;
             color: #475569;
-            background: rgba(255,255,255,0.45);
+            background: transparent;
+            background-image: none;
+            box-shadow: none;
+        }
+
+        .sidebar-new-tab-btn > image {
+            opacity: 0.75;
+        }
+
+        .sidebar-new-tab-btn label {
+            font-size: 12.5px;
+            font-weight: 600;
+            color: inherit;
         }
 
         .sidebar-new-tab-btn:hover {
             color: #1c1c1e;
-            background: rgba(255,255,255,0.85);
+            background: rgba(0,0,0,0.06);
         }
 
         window.dark .sidebar-title {
             color: #f2f2f7;
         }
 
-        window.dark .sidebar-download {
+        window.dark .sidebar-workspace-pill {
+            color: #a6adbd;
+            background: transparent;
+        }
+
+        window.dark .sidebar-workspace-pill:hover {
+            color: #ffffff;
+            background: rgba(255,255,255,0.07);
+        }
+
+        window.dark .sidebar-icon-btn {
             color: #a6adbd;
         }
 
-        window.dark .sidebar-download:hover {
+        window.dark .sidebar-icon-btn:hover {
             color: #ffffff;
             background: rgba(255,255,255,0.10);
         }
@@ -2374,21 +2409,19 @@ fn install_css() {
 
         window.dark .sidebar-tab-row,
         window.dark .sidebar-pinned-tab-row {
-            border-color: rgba(255,255,255,0.08);
-            background: rgba(255,255,255,0.045);
-            color: #e6e6eb;
+            background: transparent;
+            color: #b6bcc9;
         }
 
         window.dark .sidebar-tab-row:hover,
         window.dark .sidebar-pinned-tab-row:hover {
-            background: rgba(255,255,255,0.08);
-            border-color: rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.07);
         }
 
         window.dark .sidebar-tab-row.active-tab,
         window.dark .sidebar-pinned-tab-row.active-tab {
-            background: #303747;
-            border-color: rgba(111,153,255,0.42);
+            background: rgba(255,255,255,0.11);
+            color: #ffffff;
         }
 
         window.dark .sidebar-tab-row label,
@@ -2396,19 +2429,43 @@ fn install_css() {
             color: #e6e6eb;
         }
 
+        window.dark .sidebar-tab-row .tab-pin,
+        window.dark .sidebar-pinned-tab-row .tab-pin {
+            color: #a6adbd;
+        }
+
+        window.dark .sidebar-tab-row .tab-pin:hover,
+        window.dark .sidebar-pinned-tab-row .tab-pin:hover {
+            background: rgba(255,255,255,0.10);
+            color: #ffffff;
+        }
+
+        window.dark .sidebar-tab-row .tab-close:hover,
+        window.dark .sidebar-pinned-tab-row .tab-close:hover {
+            background: rgba(255,255,255,0.10);
+        }
+
         window.dark .sidebar-new-tab-btn {
-            border-color: rgba(255,255,255,0.08);
-            color: #c8cdd8;
-            background: rgba(255,255,255,0.04);
+            color: #a6adbd;
+            background: transparent;
+        }
+
+        window.dark .sidebar-new-tab-btn > image {
+            opacity: 0.8;
+        }
+
+        window.dark .sidebar-new-tab-btn label {
+            color: inherit;
         }
 
         window.dark .sidebar-new-tab-btn:hover {
             color: #ffffff;
-            background: rgba(255,255,255,0.09);
+            background: rgba(255,255,255,0.07);
         }
 
         .sidebar-bottom {
             padding-top: 6px;
+            padding-left: 2px;
         }
 
         .sidebar-settings-btn, window.light .sidebar-settings-btn {
@@ -2666,6 +2723,10 @@ fn install_css() {
             min-width: 0;
             min-height: 0;
             opacity: 0;
+            background: transparent;
+            background-image: none;
+            border: 0;
+            box-shadow: none;
         }
 
         /* ── URL bar (Compact left-side address bar) ───────────── */
@@ -2684,7 +2745,9 @@ fn install_css() {
         }
 
         .sidebar-urlbar {
-            margin: 0 0 8px;
+            margin: 2px 0 12px;
+            border-radius: 10px;
+            min-height: 32px;
         }
 
         .urlbar text, window.light .urlbar text {
@@ -2858,6 +2921,7 @@ fn install_css() {
             padding: 5px 10px;
             border-radius: 10px;
             background: transparent;
+            background-image: none;
             color: #64748b;
             border: 0;
             box-shadow: none;
@@ -2934,11 +2998,12 @@ fn install_css() {
         }
 
         .settings-modal-close-btn, window.light .settings-modal-close-btn {
-            min-width: 28px;
-            min-height: 28px;
-            padding: 4px;
-            border-radius: 9px;
-            background-color: rgba(100, 116, 139, 0.08);
+            min-width: 30px;
+            min-height: 30px;
+            padding: 0;
+            border-radius: 999px;
+            background-color: #e8ecf3;
+            background-image: none;
             color: #64748b;
             border: 0;
             box-shadow: none;
@@ -2946,6 +3011,7 @@ fn install_css() {
 
         .settings-modal-close-btn:hover, window.light .settings-modal-close-btn:hover {
             background-color: #fee2e2;
+            background-image: none;
             color: #dc2626;
         }
 
@@ -2993,6 +3059,7 @@ fn install_css() {
         .settings-dropdown-btn, window.light .settings-dropdown-btn {
             min-height: 30px;
             background-color: #f8fafc;
+            background-image: none;
             border: 1px solid #cbd5e1;
             border-radius: 9px;
             color: #334155;
@@ -3027,6 +3094,7 @@ fn install_css() {
         .settings-shortcut-badge, .settings-shortcut-badge label,
         window.light .settings-shortcut-badge, window.light .settings-shortcut-badge label {
             background-color: #f1f5f9;
+            background-image: none;
             border: 1px solid #dbe2ec;
             border-radius: 8px;
             padding: 3px 8px;
@@ -3239,13 +3307,15 @@ fn install_css() {
 
         window.dark .settings-modal-close-btn,
         .settings-modal-close-btn.dark {
-            background-color: rgba(255, 255, 255, 0.055);
-            color: #9ba3b4;
+            background-color: #2a2e39;
+            background-image: none;
+            color: #aab1c2;
         }
 
         window.dark .settings-modal-close-btn:hover,
         .settings-modal-close-btn.dark:hover {
             background-color: rgba(239, 68, 68, 0.16);
+            background-image: none;
             color: #fca5a5;
         }
 
@@ -3280,6 +3350,7 @@ fn install_css() {
         window.dark .settings-dropdown-btn,
         .settings-dropdown-btn.dark {
             background-color: #2a2a34;
+            background-image: none;
             border: 1px solid #3c3c49;
             color: #e8e9ee;
         }
@@ -3294,6 +3365,7 @@ fn install_css() {
         window.dark .settings-dropdown-btn:hover,
         .settings-dropdown-btn.dark:hover {
             background-color: #32323e;
+            background-image: none;
             border-color: #505064;
             color: #ffffff;
         }
@@ -3310,6 +3382,7 @@ fn install_css() {
         .settings-shortcut-badge.dark,
         .settings-shortcut-badge.dark label {
             background-color: #2a2a34;
+            background-image: none;
             border: 1px solid #3c3c49;
             color: #c8cdd8;
         }
