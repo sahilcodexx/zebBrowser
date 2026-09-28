@@ -65,6 +65,10 @@ extern "C" {
     // ----- WebKitSettings -----
     pub fn webkit_settings_new() -> *mut WebKitSettings;
     pub fn webkit_settings_set_enable_javascript(settings: *mut WebKitSettings, enabled: c_int);
+    pub fn webkit_settings_set_user_agent(
+        settings: *mut WebKitSettings,
+        user_agent: *const c_char,
+    );
     pub fn webkit_settings_set_javascript_can_open_windows_automatically(
         settings: *mut WebKitSettings,
         enabled: c_int,

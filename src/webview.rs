@@ -28,6 +28,14 @@ impl WebView {
             panic!("webkit_settings_new returned null");
         }
         unsafe {
+            // Chrome UA — sites (YouTube in particular) bot-detect unknown
+            // engines like raw WebKitGTK and demand login before playing.
+            // A mainstream UA keeps content playable without sign-in.
+            let ua = CString::new(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            )
+            .unwrap_or_default();
+            ffi::webkit_settings_set_user_agent(settings, ua.as_ptr());
             ffi::webkit_settings_set_enable_javascript(settings, 1);
             ffi::webkit_settings_set_auto_load_images(settings, 1);
             ffi::webkit_settings_set_javascript_can_open_windows_automatically(settings, 1);
