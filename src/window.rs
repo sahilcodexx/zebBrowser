@@ -449,11 +449,12 @@ impl BrowserWindow {
         let page_name = format!("page-{}", self.tabs.borrow().len());
 
         let me_weak: Weak<Self> = self.self_weak.clone();
+        let owning_tab: Rc<Tab> = Rc::clone(&tab);
         tab.on_event(move |ev| {
             let Some(me) = me_weak.upgrade() else { return };
             let cur = me.current.borrow().clone();
             let current_ref = cur.as_deref().map(|t| t as &Tab);
-            me.on_tab_event(current_ref, ev);
+            me.on_tab_event(current_ref, Some(&owning_tab), ev);
         });
 
         self.stack
@@ -515,9 +516,14 @@ impl BrowserWindow {
     }
 
     fn remove_tab_row(&self, row: &TabRow) {
-        self.tab_strip.remove(&row.container);
-        self.sidebar_pinned_tabs.remove(&row.container);
-        self.sidebar_tabs.remove(&row.container);
+        // The row lives in exactly one parent; Gtk.Box::remove emits a
+        // Gtk-CRITICAL if the widget isn't a child, so check first.
+        let parent = row.container.parent();
+        if let Some(p) = parent {
+            if p.is::<gtk4::Box>() {
+                p.downcast::<gtk4::Box>().unwrap().remove(&row.container);
+            }
+        }
     }
 
     fn sidebar_tab_label_for(&self, tab: &Tab) -> String {
@@ -564,14 +570,18 @@ impl BrowserWindow {
         self.current.borrow().as_ref().map(Rc::clone)
     }
 
-    fn on_tab_event(&self, _current: Option<&Tab>, ev: TabEvent) {
+    fn on_tab_event(&self, _current: Option<&Tab>, owner: Option<&Rc<Tab>>, ev: TabEvent) {
         match ev {
             TabEvent::UriChanged(uri) => {
                 let display_uri = self.address_text_for(&uri);
-                self.set_address_text(&display_uri);
-                self.update_auto_hide_for_url(&uri);
-                if let Some(tab) = self.current_tab() {
-                    if let Some(row) = self.find_row_for(&tab) {
+                if let Some(cur) = self.current_tab() {
+                    if owner.is_some_and(|o| Rc::ptr_eq(&cur, o)) {
+                        self.set_address_text(&display_uri);
+                        self.update_auto_hide_for_url(&uri);
+                    }
+                }
+                if let Some(tab) = owner {
+                    if let Some(row) = self.find_row_for(tab) {
                         // Belt-and-suspenders: force label to "New Tab" for any
                         // data:/about: URI so the raw URL never leaks into the tab pill.
                         row.title_label.set_text(&self.short_url(&uri));
@@ -582,19 +592,27 @@ impl BrowserWindow {
             }
             TabEvent::TitleChanged(title) => {
                 let short = self.short_title(&title);
-                if let Some(tab) = self.current_tab() {
-                    if let Some(row) = self.find_row_for(&tab) {
+                if let Some(tab) = owner {
+                    if let Some(row) = self.find_row_for(tab) {
                         row.title_label.set_tooltip_text(Some(&short));
                         let label = if self.chrome_layout.get() == ChromeLayout::Sidebar {
-                            self.sidebar_tab_label_for(&tab)
+                            self.sidebar_tab_label_for(tab)
                         } else {
-                            self.tab_label_for(&tab, tab.pinned.get())
+                            self.tab_label_for(tab, tab.pinned.get())
                         };
                         row.title_label.set_text(&label);
                     }
                 }
             }
             TabEvent::LoadingChanged(loading) => {
+                // Only reflect loading state of the visible tab.
+                if let Some(cur) = self.current_tab() {
+                    if !owner.is_some_and(|o| Rc::ptr_eq(&cur, o)) {
+                        return;
+                    }
+                } else {
+                    return;
+                }
                 let show_progress = loading && self.chrome_layout.get() == ChromeLayout::Topbar;
                 self.progress.set_visible(show_progress);
                 if show_progress {
@@ -604,7 +622,12 @@ impl BrowserWindow {
                 }
             }
             TabEvent::LoadFailed { uri, message } => {
-                self.render_error_page(&uri, &message);
+                // Render the error page in the tab that actually failed —
+                // never in the current tab (that used to cancel an unrelated
+                // in-flight load and cause an error-page cascade).
+                if let Some(tab) = owner {
+                    self.render_error_page_in(tab, &uri, &message);
+                }
             }
             TabEvent::PinnedChanged(_pinned) => {
                 self.resort_tabs();
@@ -783,21 +806,19 @@ impl BrowserWindow {
         }
     }
 
-    fn render_error_page(&self, uri: &str, message: &str) {
+    fn render_error_page_in(&self, tab: &Rc<Tab>, uri: &str, message: &str) {
         let html = config::ERROR_PAGE_HTML
             .replace("{uri}", &html_escape(uri))
             .replace("{message}", &html_escape(message));
-        if let Some(tab) = self.current_tab() {
-            use std::ffi::CString;
-            let c_html = CString::new(html).unwrap_or_default();
-            let c_base = CString::new(uri).unwrap_or_default();
-            unsafe {
-                ffi::webkit_web_view_load_html(
-                    tab.webview.web_view_ptr(),
-                    c_html.as_ptr(),
-                    c_base.as_ptr(),
-                );
-            }
+        use std::ffi::CString;
+        let c_html = CString::new(html).unwrap_or_default();
+        let c_base = CString::new(uri).unwrap_or_default();
+        unsafe {
+            ffi::webkit_web_view_load_html(
+                tab.webview.web_view_ptr(),
+                c_html.as_ptr(),
+                c_base.as_ptr(),
+            );
         }
     }
 

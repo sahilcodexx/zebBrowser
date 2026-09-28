@@ -105,7 +105,12 @@ extern "C" {
     );
 
     // ----- GObject -----
+    pub fn g_object_ref(obj: *mut GObject);
     pub fn g_object_unref(obj: *mut GObject);
+
+    // ----- WebKit error quarks -----
+    pub fn webkit_network_error_quark() -> u32;
+    pub fn webkit_policy_error_quark() -> u32;
 
     // ----- GLib -----
     pub fn g_signal_connect_data(
@@ -116,6 +121,8 @@ extern "C" {
         destroy_data: Option<unsafe extern "C" fn(*mut c_void)>,
         connect_flags: c_int,
     ) -> c_uint;
+
+    pub fn g_io_error_quark() -> u32;
 
     // ----- GIO -----
     pub fn g_file_new_for_path(path: *const c_char) -> *mut GObject;

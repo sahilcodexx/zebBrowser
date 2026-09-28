@@ -184,11 +184,12 @@ impl WebView {
         }
     }
 
-    /// Connect to the `load-failed` signal. The callback receives the failing URL
-    /// and a GError message; return `true` to suppress WebKit's default error page.
+    /// Connect to the `load-failed` signal. The callback receives the failing URL,
+    /// the GError message and the error domain+code so callers can filter benign
+    /// cancellations; return `true` to suppress WebKit's default error page.
     pub fn connect_load_failed<F>(&self, f: F)
     where
-        F: Fn(&str, &str) -> bool + 'static,
+        F: Fn(&str, &str, u32, i32) -> bool + 'static,
     {
         let f: Box<F> = Box::new(f);
         let data: *mut F = Box::into_raw(f);
@@ -201,7 +202,7 @@ impl WebView {
             data: *mut c_void,
         ) -> c_int
         where
-            F: Fn(&str, &str) -> bool + 'static,
+            F: Fn(&str, &str, u32, i32) -> bool + 'static,
         {
             let f: &F = &*(data as *const F);
             let uri_str = if uri.is_null() {
@@ -209,14 +210,17 @@ impl WebView {
             } else {
                 std::ffi::CStr::from_ptr(uri).to_str().unwrap_or("")
             };
-            let msg_str = if gerror.is_null() {
-                ""
+            let (msg_str, domain, code) = if gerror.is_null() {
+                ("", 0u32, 0i32)
             } else {
-                std::ffi::CStr::from_ptr((*gerror).message)
-                    .to_str()
-                    .unwrap_or("")
+                let err = &*gerror;
+                (
+                    std::ffi::CStr::from_ptr(err.message).to_str().unwrap_or(""),
+                    err.domain,
+                    err.code,
+                )
             };
-            if f(uri_str, msg_str) {
+            if f(uri_str, msg_str, domain, code) {
                 1
             } else {
                 0
