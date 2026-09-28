@@ -18,6 +18,15 @@ pub enum TabEvent {
     LoadingChanged(bool),
     LoadFailed { uri: String, message: String },
     PinnedChanged(bool),
+    FaviconReady(FaviconData),
+}
+
+/// Raw RGBA favicon pixels for a tab.
+#[derive(Debug, Clone)]
+pub struct FaviconData {
+    pub width: i32,
+    pub height: i32,
+    pub rgba: Vec<u8>,
 }
 
 pub struct Tab {
@@ -119,16 +128,59 @@ impl Tab {
         });
 
         let me_weak2: Weak<Self> = Rc::downgrade(self);
-        self.webview.connect_load_failed(move |uri, msg| {
+        self.webview.connect_load_failed(move |uri, msg, domain, code| {
             let Some(me) = me_weak2.upgrade() else {
                 return true;
             };
+            // Benign failures: navigation policy changes and cancellations
+            // (including cancellation caused by our own error-page render).
+            // Rendering an error page for these causes an infinite loop.
+            const G_IO_ERROR: u32 = 39;
+            const G_IO_ERROR_CANCELLED: i32 = 19;
+            const WEBKIT_POLICY_ERROR: u32 = 2;
+            const WEBKIT_NETWORK_ERROR: u32 = 5;
+            const WEBKIT_PLUGIN_ERROR: u32 = 6;
+            if domain == G_IO_ERROR && code == G_IO_ERROR_CANCELLED {
+                return true; // G_IO_ERROR_CANCELLED ("Operation was cancelled")
+            }
+            if domain == WEBKIT_NETWORK_ERROR && code == 3 {
+                return true; // WEBKIT_NETWORK_ERROR_CANCELLED
+            }
+            if domain == WEBKIT_POLICY_ERROR && code == 101 {
+                return true; // FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE
+            }
+            if domain == WEBKIT_PLUGIN_ERROR {
+                return true;
+            }
+            // Last-resort guard: any transient cancellation (whatever domain
+            // GIO/WebKit filed it under) must never render an error page —
+            // that page-load itself cancels the current load and loops forever.
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("cancel") {
+                return true;
+            }
             me.loading.set(false);
             me.emit(TabEvent::LoadFailed {
                 uri: uri.to_string(),
                 message: msg.to_string(),
             });
             true
+        });
+
+        // Real favicon: re-render the row whenever WebKit publishes a new icon.
+        let me_weak3: Weak<Self> = Rc::downgrade(self);
+        self.webview.connect_favicon_changed(move || {
+            let Some(me) = me_weak3.upgrade() else {
+                return;
+            };
+            let Some(fav) = me.webview.favicon() else {
+                return;
+            };
+            me.emit(TabEvent::FaviconReady(FaviconData {
+                width: fav.width,
+                height: fav.height,
+                rgba: fav.rgba,
+            }));
         });
     }
 

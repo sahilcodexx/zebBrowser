@@ -47,6 +47,7 @@ extern "C" {
 
     pub fn webkit_web_view_get_uri(web_view: *mut WebKitWebView) -> *const c_char;
     pub fn webkit_web_view_get_title(web_view: *mut WebKitWebView) -> *const c_char;
+    pub fn webkit_web_view_get_favicon(web_view: *mut WebKitWebView) -> *mut c_void;
     pub fn webkit_web_view_set_settings(
         web_view: *mut WebKitWebView,
         settings: *mut WebKitSettings,
@@ -65,6 +66,10 @@ extern "C" {
     // ----- WebKitSettings -----
     pub fn webkit_settings_new() -> *mut WebKitSettings;
     pub fn webkit_settings_set_enable_javascript(settings: *mut WebKitSettings, enabled: c_int);
+    pub fn webkit_settings_set_user_agent(
+        settings: *mut WebKitSettings,
+        user_agent: *const c_char,
+    );
     pub fn webkit_settings_set_javascript_can_open_windows_automatically(
         settings: *mut WebKitSettings,
         enabled: c_int,
@@ -101,7 +106,12 @@ extern "C" {
     );
 
     // ----- GObject -----
+    pub fn g_object_ref(obj: *mut GObject);
     pub fn g_object_unref(obj: *mut GObject);
+
+    // ----- WebKit error quarks -----
+    pub fn webkit_network_error_quark() -> u32;
+    pub fn webkit_policy_error_quark() -> u32;
 
     // ----- GLib -----
     pub fn g_signal_connect_data(
@@ -112,4 +122,66 @@ extern "C" {
         destroy_data: Option<unsafe extern "C" fn(*mut c_void)>,
         connect_flags: c_int,
     ) -> c_uint;
+
+    pub fn g_io_error_quark() -> u32;
+
+    // ----- GIO -----
+    pub fn g_file_new_for_path(path: *const c_char) -> *mut GObject;
+
+    // ----- User content filters (WebKit content blocker / adblock) -----
+    pub fn webkit_web_view_get_user_content_manager(
+        web_view: *mut WebKitWebView,
+    ) -> *mut c_void;
+    pub fn webkit_user_content_manager_add_filter(manager: *mut c_void, filter: *mut c_void);
+    pub fn webkit_user_content_manager_add_style_sheet(
+        manager: *mut c_void,
+        style_sheet: *mut c_void,
+    );
+    pub fn webkit_user_content_manager_add_script(manager: *mut c_void, script: *mut c_void);
+    pub fn webkit_user_script_new(
+        source: *const c_char,
+        injected_frames: c_int,
+        injection_time: c_int,
+        allow_list: *const *const c_char,
+        block_list: *const *const c_char,
+    ) -> *mut c_void;
+    pub fn webkit_user_style_sheet_new(
+        source: *const c_char,
+        injected_frames: c_int,
+        level: c_int,
+        allow_list: *const *const c_char,
+        block_list: *const *const c_char,
+    ) -> *mut c_void;
+    pub fn webkit_user_content_filter_store_new(path: *const c_char) -> *mut c_void;
+    pub fn webkit_user_content_filter_store_load(
+        store: *mut c_void,
+        identifier: *const c_char,
+        cancellable: *mut c_void,
+        callback: Option<unsafe extern "C" fn(*mut GObject, *mut c_void, *mut c_void)>,
+        user_data: *mut c_void,
+    );
+    pub fn webkit_user_content_filter_store_load_finish(
+        store: *mut c_void,
+        result: *mut c_void,
+        error: *mut *mut GError,
+    ) -> *mut c_void;
+    pub fn webkit_user_content_filter_store_save_from_file(
+        store: *mut c_void,
+        identifier: *const c_char,
+        file: *mut GObject,
+        cancellable: *mut c_void,
+        callback: Option<unsafe extern "C" fn(*mut GObject, *mut c_void, *mut c_void)>,
+        user_data: *mut c_void,
+    );
+    pub fn webkit_user_content_filter_store_save_from_file_finish(
+        store: *mut c_void,
+        result: *mut c_void,
+        error: *mut *mut GError,
+    ) -> *mut c_void;
+    pub fn webkit_user_content_filter_unref(filter: *mut c_void);
+
+    // ----- Network session / favicon database (WebKitGTK 2.40+) -----
+    pub fn webkit_web_view_get_network_session(web_view: *mut WebKitWebView) -> *mut c_void;
+    pub fn webkit_network_session_get_website_data_manager(session: *mut c_void) -> *mut c_void;
+    pub fn webkit_website_data_manager_set_favicons_enabled(manager: *mut c_void, enabled: c_int);
 }
