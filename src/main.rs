@@ -2,6 +2,7 @@
 //!
 //! Stack: Rust + GTK4 + WebKitGTK 6.0 (raw FFI).
 
+mod adblock;
 mod app;
 mod config;
 mod navigation;

@@ -112,4 +112,59 @@ extern "C" {
         destroy_data: Option<unsafe extern "C" fn(*mut c_void)>,
         connect_flags: c_int,
     ) -> c_uint;
+
+    // ----- GIO -----
+    pub fn g_file_new_for_path(path: *const c_char) -> *mut GObject;
+
+    // ----- User content filters (WebKit content blocker / adblock) -----
+    pub fn webkit_web_view_get_user_content_manager(
+        web_view: *mut WebKitWebView,
+    ) -> *mut c_void;
+    pub fn webkit_user_content_manager_add_filter(manager: *mut c_void, filter: *mut c_void);
+    pub fn webkit_user_content_manager_add_style_sheet(
+        manager: *mut c_void,
+        style_sheet: *mut c_void,
+    );
+    pub fn webkit_user_content_manager_add_script(manager: *mut c_void, script: *mut c_void);
+    pub fn webkit_user_script_new(
+        source: *const c_char,
+        injected_frames: c_int,
+        injection_time: c_int,
+        allow_list: *const *const c_char,
+        block_list: *const *const c_char,
+    ) -> *mut c_void;
+    pub fn webkit_user_style_sheet_new(
+        source: *const c_char,
+        injected_frames: c_int,
+        level: c_int,
+        allow_list: *const *const c_char,
+        block_list: *const *const c_char,
+    ) -> *mut c_void;
+    pub fn webkit_user_content_filter_store_new(path: *const c_char) -> *mut c_void;
+    pub fn webkit_user_content_filter_store_load(
+        store: *mut c_void,
+        identifier: *const c_char,
+        cancellable: *mut c_void,
+        callback: Option<unsafe extern "C" fn(*mut GObject, *mut c_void, *mut c_void)>,
+        user_data: *mut c_void,
+    );
+    pub fn webkit_user_content_filter_store_load_finish(
+        store: *mut c_void,
+        result: *mut c_void,
+        error: *mut *mut GError,
+    ) -> *mut c_void;
+    pub fn webkit_user_content_filter_store_save_from_file(
+        store: *mut c_void,
+        identifier: *const c_char,
+        file: *mut GObject,
+        cancellable: *mut c_void,
+        callback: Option<unsafe extern "C" fn(*mut GObject, *mut c_void, *mut c_void)>,
+        user_data: *mut c_void,
+    );
+    pub fn webkit_user_content_filter_store_save_from_file_finish(
+        store: *mut c_void,
+        result: *mut c_void,
+        error: *mut *mut GError,
+    ) -> *mut c_void;
+    pub fn webkit_user_content_filter_unref(filter: *mut c_void);
 }

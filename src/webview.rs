@@ -53,6 +53,7 @@ impl WebView {
         unsafe {
             ffi::webkit_web_view_set_settings(wv_ptr, settings);
             ffi::g_object_unref(settings);
+            crate::adblock::attach_to_webview(wv_ptr);
         }
         Self { widget }
     }
