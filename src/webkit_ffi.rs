@@ -47,6 +47,7 @@ extern "C" {
 
     pub fn webkit_web_view_get_uri(web_view: *mut WebKitWebView) -> *const c_char;
     pub fn webkit_web_view_get_title(web_view: *mut WebKitWebView) -> *const c_char;
+    pub fn webkit_web_view_get_favicon(web_view: *mut WebKitWebView) -> *mut c_void;
     pub fn webkit_web_view_set_settings(
         web_view: *mut WebKitWebView,
         settings: *mut WebKitSettings,
@@ -178,4 +179,9 @@ extern "C" {
         error: *mut *mut GError,
     ) -> *mut c_void;
     pub fn webkit_user_content_filter_unref(filter: *mut c_void);
+
+    // ----- Network session / favicon database (WebKitGTK 2.40+) -----
+    pub fn webkit_web_view_get_network_session(web_view: *mut WebKitWebView) -> *mut c_void;
+    pub fn webkit_network_session_get_website_data_manager(session: *mut c_void) -> *mut c_void;
+    pub fn webkit_website_data_manager_set_favicons_enabled(manager: *mut c_void, enabled: c_int);
 }

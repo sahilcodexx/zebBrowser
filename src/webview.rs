@@ -17,6 +17,13 @@ pub enum LoadEvent {
     Finished,
 }
 
+/// A favicon returned from WebKit, downsampled to raw RGBA pixels.
+pub struct Favicon {
+    pub width: i32,
+    pub height: i32,
+    pub rgba: Vec<u8>,
+}
+
 pub struct WebView {
     widget: Widget,
 }
@@ -61,9 +68,24 @@ impl WebView {
         unsafe {
             ffi::webkit_web_view_set_settings(wv_ptr, settings);
             ffi::g_object_unref(settings);
+            Self::enable_favicon_database(wv_ptr);
             crate::adblock::attach_to_webview(wv_ptr);
         }
         Self { widget }
+    }
+
+    /// WebKitGTK 2.40+ ships with favicons disabled — without enabling the
+    /// database on the website data manager, `notify::favicon` never fires.
+    unsafe fn enable_favicon_database(wv_ptr: *mut ffi::WebKitWebView) {
+        let session = ffi::webkit_web_view_get_network_session(wv_ptr);
+        if session.is_null() {
+            return;
+        }
+        let manager = ffi::webkit_network_session_get_website_data_manager(session);
+        if manager.is_null() {
+            return;
+        }
+        ffi::webkit_website_data_manager_set_favicons_enabled(manager, 1);
     }
 
     pub fn as_widget(&self) -> Widget {
@@ -141,6 +163,113 @@ impl WebView {
                 std::ptr::null_mut(),
             );
         }
+    }
+
+    /// The current favicon as raw RGBA pixels (empty if none available yet).
+    pub fn favicon(&self) -> Option<Favicon> {
+        let paintable = unsafe { ffi::webkit_web_view_get_favicon(self.web_view_ptr()) };
+        if paintable.is_null() {
+            return None;
+        }
+        unsafe { Self::snapshot_paintable(paintable) }
+    }
+
+    /// Connect to `notify::favicon` — fired whenever a page's icon becomes available.
+    pub fn connect_favicon_changed<F>(&self, f: F)
+    where
+        F: Fn() + 'static,
+    {
+        let f: Box<F> = Box::new(f);
+        let data: *mut F = Box::into_raw(f);
+        unsafe {
+            ffi::g_signal_connect_data(
+                self.widget.as_ptr() as *mut ffi::GObject,
+                c"notify::favicon".as_ptr() as *const c_char,
+                Some(std::mem::transmute(
+                    notify_trampoline::<F> as unsafe extern "C" fn(*mut ffi::GObject, u32, *mut c_void),
+                )),
+                data as *mut c_void,
+                Some(destroy_notify::<F>),
+                0,
+            );
+        }
+    }
+
+    /// Snapshot a GdkPaintable into downsampled RGBA bytes (GdkSnapshot + cairo).
+    unsafe fn snapshot_paintable(paintable: *mut c_void) -> Option<Favicon> {
+        use std::os::raw::c_int;
+
+        #[link(name = "gtk-4")]
+        extern "C" {
+            fn gdk_paintable_get_intrinsic_width(p: *mut c_void) -> c_int;
+            fn gdk_paintable_get_intrinsic_height(p: *mut c_void) -> c_int;
+            fn gdk_paintable_snapshot(
+                p: *mut c_void,
+                snapshot: *mut c_void,
+                width: f64,
+                height: f64,
+            );
+            fn gtk_snapshot_new() -> *mut c_void;
+            fn gtk_snapshot_to_paintable(snap: *mut c_void) -> *mut c_void;
+            fn gdk_texture_get_width(t: *mut c_void) -> c_int;
+            fn gdk_texture_get_height(t: *mut c_void) -> c_int;
+            fn gdk_texture_download(t: *mut c_void, data: *mut u8, stride: usize);
+            fn g_type_from_name(name: *const c_char) -> usize;
+            fn g_type_check_instance_is_a(instance: *mut c_void, gtype: usize) -> i32;
+        }
+
+        // Only GdkTexture supports direct pixel download; anything else goes
+        // through the snapshot fallback below.
+        let texture_gtype = g_type_from_name(c"GdkTexture".as_ptr());
+        let is_texture = texture_gtype != 0
+            && g_type_check_instance_is_a(paintable as *mut c_void, texture_gtype) != 0;
+
+        let w = gdk_paintable_get_intrinsic_width(paintable);
+        let h = gdk_paintable_get_intrinsic_height(paintable);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+
+        // Fast path: paintable is already a texture — download its pixels directly.
+        if is_texture {
+            let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+            gdk_texture_download(paintable, rgba.as_mut_ptr(), (w as usize) * 4);
+            let converted = convert_bgra_to_rgba(rgba);
+            return Some(Favicon {
+                width: w,
+                height: h,
+                rgba: converted,
+            });
+        }
+
+        // Fallback: render into a GtkSnapshot and download the resulting texture.
+        let snap = gtk_snapshot_new();
+        gdk_paintable_snapshot(paintable, snap, w as f64, h as f64);
+        let out = gtk_snapshot_to_paintable(snap);
+        // GtkSnapshot is a GObject — release it with g_object_unref.
+        ffi::g_object_unref(snap as *mut ffi::GObject);
+        let result = if out.is_null() {
+            None
+        } else {
+            let tw = gdk_texture_get_width(out);
+            let th = gdk_texture_get_height(out);
+            if tw <= 0 || th <= 0 {
+                None
+            } else {
+                let mut rgba = vec![0u8; (tw as usize) * (th as usize) * 4];
+                gdk_texture_download(out, rgba.as_mut_ptr(), (tw as usize) * 4);
+                let converted = convert_bgra_to_rgba(rgba);
+                Some(Favicon {
+                    width: tw,
+                    height: th,
+                    rgba: converted,
+                })
+            }
+        };
+        if !out.is_null() {
+            ffi::g_object_unref(out as *mut ffi::GObject);
+        }
+        result
     }
 
     /// Connect to the `load-changed` signal. Callback receives the load event kind.
@@ -247,6 +376,26 @@ impl WebView {
             );
         }
     }
+}
+
+/// gdk_texture_download delivers cairo ARGB32: premultiplied BGRA, top-down.
+/// Convert in place to premultiplied RGBA for GdkMemoryTexture.
+fn convert_bgra_to_rgba(mut rgba: Vec<u8>) -> Vec<u8> {
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2); // B <-> R
+    }
+    rgba
+}
+
+unsafe extern "C" fn notify_trampoline<F>(
+    _obj: *mut ffi::GObject,
+    _pspec: u32,
+    data: *mut c_void,
+) where
+    F: Fn() + 'static,
+{
+    let f: &F = &*(data as *const F);
+    f();
 }
 
 unsafe extern "C" fn destroy_notify<F>(data: *mut c_void) {

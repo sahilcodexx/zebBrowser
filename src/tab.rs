@@ -18,6 +18,15 @@ pub enum TabEvent {
     LoadingChanged(bool),
     LoadFailed { uri: String, message: String },
     PinnedChanged(bool),
+    FaviconReady(FaviconData),
+}
+
+/// Raw RGBA favicon pixels for a tab.
+#[derive(Debug, Clone)]
+pub struct FaviconData {
+    pub width: i32,
+    pub height: i32,
+    pub rgba: Vec<u8>,
 }
 
 pub struct Tab {
@@ -156,6 +165,22 @@ impl Tab {
                 message: msg.to_string(),
             });
             true
+        });
+
+        // Real favicon: re-render the row whenever WebKit publishes a new icon.
+        let me_weak3: Weak<Self> = Rc::downgrade(self);
+        self.webview.connect_favicon_changed(move || {
+            let Some(me) = me_weak3.upgrade() else {
+                return;
+            };
+            let Some(fav) = me.webview.favicon() else {
+                return;
+            };
+            me.emit(TabEvent::FaviconReady(FaviconData {
+                width: fav.width,
+                height: fav.height,
+                rgba: fav.rgba,
+            }));
         });
     }
 

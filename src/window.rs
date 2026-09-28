@@ -88,6 +88,10 @@ struct TabRow {
     container: GtkBox,
     title_label: Label,
     close_btn: Button,
+    favicon_letter: Label,
+    favicon_image: gtk4::Image,
+    favicon_stack: gtk4::Stack,
+    has_icon: Cell<bool>,
     tab: Weak<Tab>,
     #[allow(dead_code)]
     pin_btn: Button,
@@ -585,6 +589,10 @@ impl BrowserWindow {
                         // Belt-and-suspenders: force label to "New Tab" for any
                         // data:/about: URI so the raw URL never leaks into the tab pill.
                         row.title_label.set_text(&self.short_url(&uri));
+                        // New document → old icon is stale; show the letter tile
+                        // until WebKit publishes the new favicon.
+                        row.reset_favicon();
+                        row.update_favicon(tab);
                     }
                 }
                 // Re-order if pin state changed via load (rare).
@@ -595,6 +603,7 @@ impl BrowserWindow {
                 if let Some(tab) = owner {
                     if let Some(row) = self.find_row_for(tab) {
                         row.title_label.set_tooltip_text(Some(&short));
+                        row.update_favicon(tab);
                         let label = if self.chrome_layout.get() == ChromeLayout::Sidebar {
                             self.sidebar_tab_label_for(tab)
                         } else {
@@ -627,6 +636,13 @@ impl BrowserWindow {
                 // in-flight load and cause an error-page cascade).
                 if let Some(tab) = owner {
                     self.render_error_page_in(tab, &uri, &message);
+                }
+            }
+            TabEvent::FaviconReady(data) => {
+                if let Some(tab) = owner {
+                    if let Some(row) = self.find_row_for(tab) {
+                        row.set_favicon_rgba(&data);
+                    }
                 }
             }
             TabEvent::PinnedChanged(_pinned) => {
@@ -705,6 +721,7 @@ impl BrowserWindow {
                 }
                 if let Some(tab) = row.tab.upgrade() {
                     row.title_label.set_text(&self.sidebar_tab_label_for(&tab));
+                    row.update_favicon(&tab);
                 }
             } else {
                 row.container.remove_css_class("sidebar-tab-row");
@@ -1337,6 +1354,27 @@ impl TabRow {
         pin_btn.set_visible(false);
         container.append(&pin_btn);
 
+        // Favicon slot: real site icon when available, colored letter tile otherwise.
+        let favicon_letter = Label::new(Some("N"));
+        favicon_letter.set_css_classes(&["tab-favicon", "fav-c0"]);
+        favicon_letter.set_size_request(20, 20);
+        favicon_letter.set_valign(gtk4::Align::Center);
+        favicon_letter.set_halign(gtk4::Align::Center);
+
+        let favicon_image = gtk4::Image::new();
+        favicon_image.set_pixel_size(16);
+        favicon_image.set_valign(gtk4::Align::Center);
+        favicon_image.set_halign(gtk4::Align::Center);
+
+        let favicon_stack = gtk4::Stack::new();
+        favicon_stack.set_css_classes(&["tab-favicon-slot"]);
+        favicon_stack.set_transition_type(gtk4::StackTransitionType::None);
+        favicon_stack.add_named(&favicon_letter, Some("letter"));
+        favicon_stack.add_named(&favicon_image, Some("icon"));
+        favicon_stack.set_visible_child_name("letter");
+        favicon_stack.set_valign(gtk4::Align::Center);
+        container.append(&favicon_stack);
+
         let title_label = Label::new(Some("New Tab"));
         title_label.set_xalign(0.0);
         title_label.set_hexpand(true);
@@ -1436,10 +1474,68 @@ impl TabRow {
             container,
             title_label,
             close_btn,
+            favicon_letter,
+            favicon_image,
+            favicon_stack,
+            has_icon: Cell::new(false),
             tab: Rc::downgrade(&tab),
             pin_btn,
         });
+        row.update_favicon(&tab);
         row
+    }
+
+    /// Refresh the letter tile from the tab's title/URL (fallback when no icon).
+    fn update_favicon(&self, tab: &Tab) {
+        let title = tab.title.borrow().clone();
+        let letter = title
+            .chars()
+            .find(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "N".to_string());
+        self.favicon_letter.set_text(&letter);
+
+        let mut hash: u32 = 5381;
+        for b in tab.url.borrow().bytes() {
+            hash = hash.wrapping_mul(33).wrapping_add(b as u32);
+        }
+        let idx = (hash as usize) % 6;
+        self.favicon_letter.remove_css_class("fav-c0");
+        self.favicon_letter.remove_css_class("fav-c1");
+        self.favicon_letter.remove_css_class("fav-c2");
+        self.favicon_letter.remove_css_class("fav-c3");
+        self.favicon_letter.remove_css_class("fav-c4");
+        self.favicon_letter.remove_css_class("fav-c5");
+        self.favicon_letter.add_css_class(&format!("fav-c{idx}"));
+
+        if !self.has_icon.get() {
+            self.favicon_stack.set_visible_child_name("letter");
+        }
+    }
+
+    /// Called on navigation: the old icon is stale, drop back to the letter tile.
+    fn reset_favicon(&self) {
+        self.has_icon.set(false);
+        self.favicon_stack.set_visible_child_name("letter");
+    }
+
+    /// Show the real site favicon from raw RGBA pixels.
+    fn set_favicon_rgba(&self, data: &crate::tab::FaviconData) {
+        if data.width <= 0 || data.height <= 0 || data.rgba.is_empty() {
+            return;
+        }
+        let bytes = gtk4::glib::Bytes::from(&data.rgba);
+        let texture = gtk4::gdk::MemoryTexture::new(
+            data.width,
+            data.height,
+            gtk4::gdk::MemoryFormat::R8g8b8a8Premultiplied,
+            &bytes,
+            (data.width as usize) * 4,
+        );
+        self.favicon_image.set_paintable(Some(&texture));
+        self.favicon_image.set_pixel_size(16);
+        self.has_icon.set(true);
+        self.favicon_stack.set_visible_child_name("icon");
     }
 }
 
@@ -2136,6 +2232,23 @@ fn install_css() {
             background: rgba(0,0,0,0.07);
         }
 
+        /* Favicon letter tiles */
+        .tab-favicon {
+            min-width: 20px;
+            min-height: 20px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #ffffff;
+        }
+
+        .fav-c0 { background-color: #6366f1; }
+        .fav-c1 { background-color: #0ea5e9; }
+        .fav-c2 { background-color: #10b981; }
+        .fav-c3 { background-color: #f59e0b; }
+        .fav-c4 { background-color: #ef4444; }
+        .fav-c5 { background-color: #8b5cf6; }
+
         .sidebar-content {
             padding: 2px 0 0;
         }
@@ -2186,6 +2299,11 @@ fn install_css() {
             color: #334155;
             font-size: 12.5px;
             font-weight: 600;
+        }
+
+        .sidebar-tab-row .tab-favicon,
+        .sidebar-pinned-tab-row .tab-favicon {
+            margin-right: 4px;
         }
 
         .sidebar-tab-row .tab-pin,
@@ -2244,6 +2362,10 @@ fn install_css() {
         window.dark .sidebar-download:hover {
             color: #ffffff;
             background: rgba(255,255,255,0.10);
+        }
+
+        window.dark .tab-favicon {
+            color: rgba(255,255,255,0.92);
         }
 
         window.dark .sidebar-section-label {
