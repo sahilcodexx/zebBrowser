@@ -313,6 +313,227 @@ impl WebView {
         }
     }
 
+    /// Connect to the `create` signal (target=_blank links, window.open).
+    /// The callback receives the requested URI; return `true` from the FFI
+    /// callback to tell WebKit the navigation is handled (new tab) rather
+    /// than creating a new window.
+    pub fn connect_create<F>(&self, f: F)
+    where
+        F: Fn(String) + 'static,
+    {
+        let f: Box<F> = Box::new(f);
+        let data: *mut F = Box::into_raw(f);
+
+        unsafe extern "C" fn trampoline<F>(
+            _web_view: *mut ffi::WebKitWebView,
+            navigation_action: *mut c_void,
+            data: *mut c_void,
+        ) -> *mut c_void
+        where
+            F: Fn(String) + 'static,
+        {
+            let f: &F = &*(data as *const F);
+            // Script popups (no user gesture) are dropped by the adblock
+            // popup layer; here we only receive gesture-initiated opens.
+            let mut uri = String::new();
+            if !navigation_action.is_null() {
+                let request =
+                    ffi::webkit_navigation_action_get_request(navigation_action);
+                if !request.is_null() {
+                    let uri_ptr = ffi::webkit_uri_request_get_uri(request);
+                    if !uri_ptr.is_null() {
+                        uri = std::ffi::CStr::from_ptr(uri_ptr)
+                            .to_string_lossy()
+                            .into_owned();
+                    }
+                }
+            }
+            f(uri);
+            // Returning NULL cancels WebKit's own new-window creation — the
+            // URI was already handed to the app, which opens a real tab.
+            // (Returning a webview here would load the URI into THAT view.)
+            std::ptr::null_mut()
+        }
+
+        unsafe {
+            ffi::g_signal_connect_data(
+                self.widget.as_ptr() as *mut ffi::GObject,
+                c"create".as_ptr() as *const c_char,
+                Some(std::mem::transmute(
+                    trampoline::<F> as unsafe extern "C" fn(
+                        *mut ffi::WebKitWebView,
+                        *mut c_void,
+                        *mut c_void,
+                    ) -> *mut c_void,
+                )),
+                data as *mut c_void,
+                Some(destroy_notify::<F>),
+                0,
+            );
+        }
+    }
+
+    /// Connect to `enter-fullscreen` / `leave-fullscreen` (GTK4 names —
+    /// `fullscreen-mode-start/stop` only exist in the GTK3 API). Handlers
+    /// return FALSE so WebKit still performs the actual fullscreen change.
+    pub fn connect_fullscreen_mode<F>(&self, f: F)
+    where
+        F: Fn(bool) + 'static,
+    {
+        let f: Box<F> = Box::new(f);
+        let data: *mut F = Box::into_raw(f);
+
+        unsafe extern "C" fn trampoline<F>(
+            _web_view: *mut ffi::WebKitWebView,
+            data: *mut c_void,
+        ) -> i32
+        where
+            F: Fn(bool) + 'static,
+        {
+            let f: &F = &*(data as *const F);
+            f(true);
+            0 // FALSE — let WebKit enter fullscreen
+        }
+        unsafe extern "C" fn stop_trampoline<F>(
+            _web_view: *mut ffi::WebKitWebView,
+            data: *mut c_void,
+        ) -> i32
+        where
+            F: Fn(bool) + 'static,
+        {
+            let f: &F = &*(data as *const F);
+            f(false);
+            0
+        }
+
+        // One closure shared by both signals; the destroy notify is attached
+        // to the second connection only, so the Box is freed exactly once.
+        unsafe {
+            ffi::g_signal_connect_data(
+                self.widget.as_ptr() as *mut ffi::GObject,
+                c"enter-fullscreen".as_ptr() as *const c_char,
+                Some(std::mem::transmute(
+                    trampoline::<F>
+                        as unsafe extern "C" fn(*mut ffi::WebKitWebView, *mut c_void) -> i32,
+                )),
+                data as *mut c_void,
+                None,
+                0,
+            );
+            ffi::g_signal_connect_data(
+                self.widget.as_ptr() as *mut ffi::GObject,
+                c"leave-fullscreen".as_ptr() as *const c_char,
+                Some(std::mem::transmute(
+                    stop_trampoline::<F>
+                        as unsafe extern "C" fn(*mut ffi::WebKitWebView, *mut c_void) -> i32,
+                )),
+                data as *mut c_void,
+                Some(destroy_notify::<F>),
+                0,
+            );
+        }
+    }
+
+    /// Wire `download-started` on the WebView's NETWORK SESSION — in the
+    /// GTK4 API that signal moved off WebKitWebView (connecting it on the
+    /// view fails with a GObject-CRITICAL and never fires). Only the first
+    /// call per process takes effect; WebKit shares one session.
+    pub fn connect_session_downloads<F>(&self, f: F)
+    where
+        F: Fn(*mut ffi::WebKitDownload) + 'static,
+    {
+        let session = unsafe { ffi::webkit_web_view_get_network_session(self.web_view_ptr()) };
+        if session.is_null() {
+            eprintln!("[download] no network session — downloads UI disabled");
+            return;
+        }
+        let f: Box<F> = Box::new(f);
+        let data: *mut F = Box::into_raw(f);
+
+        unsafe extern "C" fn trampoline<F>(
+            _session: *mut c_void,
+            download: *mut ffi::WebKitDownload,
+            data: *mut c_void,
+        ) where
+            F: Fn(*mut ffi::WebKitDownload) + 'static,
+        {
+            let f: &F = &*(data as *const F);
+            f(download);
+        }
+
+        unsafe {
+            ffi::g_signal_connect_data(
+                session as *mut ffi::GObject,
+                c"download-started".as_ptr() as *const c_char,
+                Some(std::mem::transmute(
+                    trampoline::<F> as unsafe extern "C" fn(
+                        *mut c_void,
+                        *mut ffi::WebKitDownload,
+                        *mut c_void,
+                    ),
+                )),
+                data as *mut c_void,
+                Some(destroy_notify::<F>),
+                0,
+            );
+        }
+    }
+
+    // ── Zoom ────────────────────────────────────────────────────────────────
+
+    pub fn zoom_level(&self) -> f64 {
+        unsafe { ffi::webkit_web_view_get_zoom_level(self.web_view_ptr()) }
+    }
+
+    pub fn set_zoom_level(&self, level: f64) {
+        unsafe { ffi::webkit_web_view_set_zoom_level(self.web_view_ptr(), level) }
+    }
+
+    // ── Find in page ────────────────────────────────────────────────────────
+
+    pub fn find_search(&self, text: &str, forward: bool) {
+        let c = match CString::new(text) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        unsafe {
+            let controller = ffi::webkit_web_view_get_find_controller(self.web_view_ptr());
+            if controller.is_null() {
+                return;
+            }
+            let options = ffi::FIND_OPTIONS_CASE_INSENSITIVE | ffi::FIND_OPTIONS_WRAP_AROUND;
+            ffi::webkit_find_controller_search(controller, c.as_ptr(), options, ffi::FIND_MAX_MATCHES);
+            let _ = forward;
+        }
+    }
+
+    pub fn find_next(&self) {
+        unsafe {
+            let controller = ffi::webkit_web_view_get_find_controller(self.web_view_ptr());
+            if !controller.is_null() {
+                ffi::webkit_find_controller_search_next(controller);
+            }
+        }
+    }
+
+    pub fn find_prev(&self) {
+        unsafe {
+            let controller = ffi::webkit_web_view_get_find_controller(self.web_view_ptr());
+            if !controller.is_null() {
+                ffi::webkit_find_controller_search_previous(controller);
+            }
+        }
+    }
+
+    pub fn find_finish(&self) {
+        unsafe {
+            let controller = ffi::webkit_web_view_get_find_controller(self.web_view_ptr());
+            if !controller.is_null() {
+                ffi::webkit_find_controller_search_finish(controller);
+            }
+        }
+    }
+
     /// Connect to the `load-failed` signal. The callback receives the failing URL,
     /// the GError message and the error domain+code so callers can filter benign
     /// cancellations; return `true` to suppress WebKit's default error page.
@@ -398,7 +619,7 @@ unsafe extern "C" fn notify_trampoline<F>(
     f();
 }
 
-unsafe extern "C" fn destroy_notify<F>(data: *mut c_void) {
+pub(crate) unsafe extern "C" fn destroy_notify<F>(data: *mut c_void) {
     if !data.is_null() {
         let _ = Box::from_raw(data as *mut F);
     }

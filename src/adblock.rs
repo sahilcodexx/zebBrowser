@@ -1,24 +1,100 @@
-//! Native adblocking via WebKitGTK's content-blocker (UserContentFilterStore)
-//! plus cosmetic (element-hiding) filtering via user stylesheets.
+//! Ad blocking powered by Brave's `adblock` engine (adblock-rust), the same
+//! engine that powers Brave's native adblocker.
 //!
-//! On first run EasyList is downloaded and split into:
-//!   • network rules  → WebKit content-blocker JSON → compiled native filter
-//!   • element-hiding → CSS injected as user stylesheets (global + per-domain)
-//! Fully native — no proxy, no JS injection per request.
+//! Two layers, both driven from one EasyList download:
+//!
+//!   1. **Engine** — every navigation/response the webview requests is checked
+//!      against the engine via `decide-policy`; matching requests are ignored
+//!      before WebKit ever fetches them.
+//!   2. **WebKit content blocker** — the engine converts the same rules into
+//!      WebKit's native content-blocker JSON (`into_content_blocking`), which
+//!      is compiled through `UserContentFilterStore`. This also blocks
+//!      subresource/media loads the policy handler never sees.
+//!
+//! On top of that: cosmetic (element-hiding) stylesheets and a YouTube
+//! scriptlet injected at document-start, as before. No fragile hand-written
+//! JSON conversion — parsing, exception handling and conversion are all done
+//! by the engine.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::os::raw::c_void;
+use std::os::raw::{c_uint, c_void};
 use std::path::PathBuf;
+
+use adblock::content_blocking::CbRule;
+use adblock::lists::{FilterSet, ParseOptions};
+use adblock::request::Request;
 
 use crate::webkit_ffi as ffi;
 
-const EASYLIST_URL: &str = "https://easylist.to/easylist/easylist.txt";
 const FILTER_ID: &str = "easylist";
-/// Max per-domain element-hiding domains kept (top by selector count).
-const MAX_COSMETIC_DOMAINS: usize = 400;
-/// Max global (unqualified) element-hiding selectors.
-const MAX_GLOBAL_SELECTORS: usize = 3000;
+
+/// Filter lists, mirroring uBlock Origin's defaults. EasyList alone fails
+/// aggressive tests (canyoublockit) — the uBO lists carry the anti-adblock
+/// and annoyance rules that pass them.
+struct FilterList {
+    name: &'static str,
+    url: &'static str,
+}
+
+const FILTER_LISTS: &[FilterList] = &[
+    FilterList { name: "easylist", url: "https://easylist.to/easylist/easylist.txt" },
+    FilterList { name: "easyprivacy", url: "https://easylist.to/easylist/easyprivacy.txt" },
+    FilterList {
+        name: "ublock-filters",
+        url: "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt",
+    },
+    // uAssets' filters/annoyances.txt is a TEMPLATE (%timestamp% + !#include
+    // directives we don't expand) — downloading it yields ~0 usable rules.
+    // The easylist.to mirror serves Fanboy's Annoyance list pre-expanded.
+    FilterList {
+        name: "fanboy-annoyance",
+        url: "https://easylist.to/easylist/fanboy-annoyance.txt",
+    },
+];
+
+/// Pure ad/tracker hosts the shipped lists miss — their rules often use
+/// options the content-blocker converter must skip ($redirect, $removeparam,
+/// $csp) or uBO scriptlets, so the host keeps loading. Blocking the host
+/// outright is safe for these.
+const BUILTIN_BLOCKLIST: &[&str] = &[
+    "||ads.youtube.com^",
+    "||ads-api.tiktok.com^",
+    "||ads-sg.tiktok.com^",
+    "||ads.tiktok.com^",
+    "||business-api.tiktok.com^",
+    "||log.byteoversea.com^",
+    "||analyticsengine.s3.amazonaws.com^",
+    "||analytics.s3.amazonaws.com^",
+    "||m.doubleclick.net^",
+    "||mediavisor.doubleclick.net^",
+    "||afs.googlesyndication.com^",
+    "||udcm.yahoo.com^",
+    "||analytics.query.yahoo.com^",
+    "||partnerads.ysm.yahoo.com^",
+    "||log.fc.yahoo.com^",
+    "||appmetrica.yandex.ru^",
+    "||ads-api.twitter.com^",
+    "||ads.pinterest.com^",
+    "||an.facebook.com^",
+];
+
+/// YouTube's own player/telemetry endpoints. Some list rules match paths
+/// under these (stats pings, innertube calls); when one gets blocked the
+/// player intermittently fails with "Something went wrong". uBlock never
+/// lets those rules fire here — explicit exceptions keep playback stable.
+/// Exception (@@) rules convert to `ignore-previous-rules` and are ordered
+/// last in the content-blocker export, so they win over any block above.
+const BUILTIN_ALLOWLIST: &[&str] = &[
+    "@@||youtube.com/api/",
+    "@@||youtube.com/youtubei/",
+    "@@||youtube.com/get_video_info*",
+    "@@||googlevideo.com/videoplayback*",
+];
+
+/// Shared app-data dir (also used by session persistence).
+pub fn data_dir_shared() -> PathBuf {
+    data_dir()
+}
 
 fn data_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -27,320 +103,95 @@ fn data_dir() -> PathBuf {
         .join(".local/share/light-browser")
 }
 
-fn network_json_path() -> PathBuf {
-    // v4: valid resource-type names + css-display-none rules.
-    data_dir().join("easylist.v4.json")
+/// Per-list raw cache (kept to avoid re-downloading when only the JSON
+/// generation changes).
+fn list_cache_path(name: &str) -> PathBuf {
+    data_dir().join("lists").join(format!("{name}.txt"))
 }
 
-fn cosmetic_global_path() -> PathBuf {
-    data_dir().join("cosmetic.global.v4.css")
-}
-
-fn cosmetic_domains_css_path() -> PathBuf {
-    data_dir().join("cosmetic.domains.v4.css")
-}
-
-fn cosmetic_domains_list_path() -> PathBuf {
-    data_dir().join("cosmetic.domains.v4.list")
+/// Content-blocker rules generated by the engine. Bump `v` when built-in
+/// rules or the on-disk format change to force regeneration (stale files
+/// persist on disk). v9: pretty JSON so chunking can slice real arrays.
+fn rules_cache_path() -> PathBuf {
+    data_dir().join("easylist.engine.v9.json")
 }
 
 fn filter_store_dir() -> PathBuf {
     data_dir().join("filters")
 }
 
-// ── EasyList → WebKit conversion ─────────────────────────────────────────────
-
-pub struct AdblockData {
-    pub network_json: String,
-    pub global_css: String,
-    /// (domain glob like "*://*.example.com/*", ) parallel to domain_css
-    pub cosmetic_domains: Vec<String>,
-    pub domain_css: String,
+/// Reject template/stub responses: uAssets master files like
+/// filters/annoyances.txt use `%timestamp%` placeholders and `!#include`
+/// directives that we don't expand — caching one silently yields 0 rules.
+fn list_text_looks_valid(text: &str) -> bool {
+    !text.trim().is_empty()
+        && !text.contains("%timestamp%")
+        && !text.lines().any(|l| l.starts_with("!#include"))
 }
 
-/// Convert EasyList text into WebKit content-blocker JSON + cosmetic CSS.
-fn easylist_to_filters(text: &str) -> AdblockData {
-    let mut rules: Vec<String> = Vec::new();
-    let mut global_selectors: Vec<String> = Vec::new();
-    let mut domain_selectors: HashMap<String, Vec<String>> = HashMap::new();
+// ── Rule generation (engine-driven) ──────────────────────────────────────────
 
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('!') || line.starts_with('[') || line == "#" {
-            continue; // comments / metadata
-        }
-
-        // ── Cosmetic (element-hiding) rules ──
-        if let Some((lhs, rhs)) = split_cosmetic(line) {
-            // `#@#` is an *exception* hiding rule (un-hide); skipping keeps
-            // generic hiding active, which is the safe default.
-            if is_cosmetic_exception(line) {
-                continue;
-            }
-            let selector = rhs.trim().to_string();
-            if selector.is_empty() {
-                continue;
-            }
-            let domains = lhs.trim_end();
-            if domains.is_empty() {
-                // Global hiding rule.
-                if global_selectors.len() < MAX_GLOBAL_SELECTORS {
-                    global_selectors.push(selector);
-                }
-            } else if !domains.contains('~') && domains.len() < 128 {
-                for d in domains.split(',') {
-                    let d = d.trim();
-                    if !d.is_empty() {
-                        domain_selectors
-                            .entry(d.to_string())
-                            .or_default()
-                            .push(selector.clone());
-                    }
-                }
-            }
-            continue;
-        }
-
-        // ── Network rules ──
-        if line.starts_with('#') {
-            continue;
-        }
-
-        let mut is_exception = false;
-        let mut rule = line.to_string();
-        if let Some(rest) = rule.strip_prefix("@@") {
-            is_exception = true;
-            rule = rest.to_string();
-        }
-
-        // Options after '$': keep only the ones we can express.
-        let mut third_party = false;
-        let mut resource_types: Vec<&str> = Vec::new();
-        if let Some(dollar) = rule.find('$') {
-            let opts: Vec<&str> = rule[dollar + 1..].split(',').collect();
-            let mut supported = true;
-            for o in &opts {
-                match *o {
-                    "third-party" => third_party = true,
-                    "script" => resource_types.push("script"),
-                    "image" => resource_types.push("image"),
-                    "stylesheet" => resource_types.push("style-sheet"),
-                    "media" => resource_types.push("media"),
-                    "font" => resource_types.push("font"),
-                    "xmlhttprequest" => resource_types.push("raw"),
-                    "subdocument" => resource_types.push("document"),
-                    "popup" => resource_types.push("popup"),
-                    "document" | "~third-party" | "~script" | "~image"
-                    | "~stylesheet" | "~media" | "~font" | "~xmlhttprequest"
-                    | "~subdocument" => {}
-                    _ => {
-                        supported = false;
-                        break;
-                    }
-                }
-            }
-            if !supported {
-                continue;
-            }
-            rule.truncate(dollar);
-        }
-        if rule.is_empty() {
-            continue;
-        }
-
-        // Trailing `|` = ends-with anchor.
-        let mut end_anchor = false;
-        if rule.ends_with('|') {
-            end_anchor = true;
-            rule.pop();
-        }
-        if rule.is_empty() {
-            continue;
-        }
-
-        let url_filter = if let Some(rest) = rule.strip_prefix("||") {
-            escape_regex(rest)
-        } else if let Some(rest) = rule.strip_prefix('|') {
-            format!("^{}", escape_regex(rest))
-        } else {
-            escape_regex(&rule)
-        };
-        let url_filter = if end_anchor {
-            format!("{url_filter}$")
-        } else {
-            url_filter
-        };
-
-        if url_filter.is_empty() {
-            continue;
-        }
-
-        let action = if is_exception {
-            "ignore-previous-rules"
-        } else {
-            "block"
-        };
-        let mut trigger = format!("\"url-filter\":\"{}\"", json_escape(&url_filter));
-        // WebKit content-blocker format: trigger flags are ARRAYS.
-        if third_party {
-            trigger.push_str(",\"load-type\":[\"third-party\"]");
-        }
-        if !resource_types.is_empty() {
-            let types = resource_types
-                .iter()
-                .map(|t| format!("\"{t}\""))
-                .collect::<Vec<_>>()
-                .join(",");
-            trigger.push_str(&format!(",\"resource-type\":[{types}]"));
-        }
-        rules.push(format!(
-            "{{\"action\":{{\"type\":\"{action}\"}},\"trigger\":{{{trigger}}}}}"
-        ));
+/// Append built-in block/allow rules to the combined list text. The
+/// allowlist MUST come after everything else — exceptions win in the
+/// content-blocker ordering (`ignore-previous-rules` last).
+fn augment_lists(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2048);
+    out.push_str(text);
+    out.push_str("! --- light-browser built-in rules ---\n");
+    for r in BUILTIN_BLOCKLIST {
+        out.push_str(r);
+        out.push('\n');
     }
-
-    // Aggregate cosmetic CSS: top-N domains by selector count.
-    let mut by_count: Vec<(String, Vec<String>)> = domain_selectors.into_iter().collect();
-    by_count.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-    by_count.truncate(MAX_COSMETIC_DOMAINS);
-
-    // Domain-qualified hiding via native css-display-none actions
-    // (if-domain trigger) — injected by the engine itself, no stylesheets.
-    let mut css_domains: Vec<String> = Vec::new();
-    let mut domain_css_parts: Vec<String> = Vec::new();
-    for (domain, sels) in &by_count {
-        let joined = sels.join(", ");
-        rules.push(format!(
-            "{{\"action\":{{\"type\":\"css-display-none\",\"selector\":\"{}\"}},\"trigger\":{{\"url-filter\":\".*\",\"if-domain\":[\"*{}\"]}}}}",
-            json_escape(&joined),
-            json_escape(domain)
-        ));
-        // Kept for the stylesheet fallback path (unused when rules succeed).
-        css_domains.push(format!("*://*.{domain}/*"));
-        domain_css_parts.push(css_hide(sels));
-    }
-
-    AdblockData {
-        network_json: format!("[{}]", rules.join(",")),
-        global_css: css_hide(&global_selectors),
-        cosmetic_domains: css_domains,
-        domain_css: domain_css_parts.join("\n"),
-    }
-}
-
-/// Find the earliest element-hiding separator. Returns (lhs, rhs).
-fn split_cosmetic(line: &str) -> Option<(&str, &str)> {
-    for sep in ["#@#", "#?#", "#$#", "##"] {
-        if let Some(pos) = line.find(sep) {
-            // `#@#` is an exception (allow) rule — treat as cosmetic too but
-            // callers skip because the check below handles ordering.
-            return Some((&line[..pos], &line[pos + sep.len()..]));
-        }
-    }
-    None
-}
-
-/// Exception hiding rules (`#@#`) must NOT hide anything; skip them.
-fn is_cosmetic_exception(line: &str) -> bool {
-    line.contains("#@#")
-}
-
-fn css_hide(selectors: &[String]) -> String {
-    if selectors.is_empty() {
-        return String::new();
-    }
-    let joined = selectors.join(",\n");
-    format!("{joined} {{ display: none !important; visibility: hidden !important; }}\n")
-}
-
-/// WebKit's url-filter is a JS regex. EasyList → regex:
-///   `^` separator wildcard, `*` global wildcard, everything else literal.
-fn escape_regex(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 16);
-    for c in s.chars() {
-        match c {
-            '.' => out.push_str("\\."),
-            '+' => out.push_str("\\+"),
-            '?' => out.push_str("\\?"),
-            '(' => out.push_str("\\("),
-            ')' => out.push_str("\\)"),
-            '[' => out.push_str("\\["),
-            ']' => out.push_str("\\]"),
-            '{' => out.push_str("\\{"),
-            '}' => out.push_str("\\}"),
-            '|' => out.push_str("\\|"),
-            '$' => out.push_str("\\$"),
-            // Separator wildcard: any char that is not alnum/._%- (or end).
-            '^' => out.push_str("([^a-zA-Z0-9._%+-]|$)"),
-            // Global wildcard.
-            '*' => out.push_str(".*"),
-            other => out.push(other),
-        }
+    for r in BUILTIN_ALLOWLIST {
+        out.push_str(r);
+        out.push('\n');
     }
     out
 }
 
-/// Escape for embedding inside a JSON string literal.
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
+/// Parse the combined lists with the engine and convert to WebKit
+/// content-blocker JSON. Returns `None` when no rule could be converted.
+pub fn build_rules(easylist: &str) -> Option<String> {
+    let mut set = FilterSet::new(true); // debug: keep raw lines for conversion
+    set.add_filter_list(easylist.to_string(), ParseOptions::default());
+    let (rules, _used) = set.into_content_blocking().ok()?;
+    if rules.is_empty() {
+        return None;
+    }
+    // Pretty JSON: the compiler slices this file into chunks, and per-chunk
+    // parsing needs real array boundaries.
+    serde_json::to_string_pretty(&rules).ok()
+}
+
+// ── Rule chunking (WebKit per-save limit) ────────────────────────────────
+
+/// WebKit's UserContentFilterStore rejects a single save with too many
+/// rules ("Too many rules in JSON array" — hit at ~180k, passed at 132k).
+/// Compile in slices well under the cap. Filters apply in add order and
+/// later filters win, so exceptions (`ignore-previous-rules`) must land in
+/// the LAST chunk — the engine's export already orders them last, so
+/// preserving order across the slice boundary keeps that guarantee.
+const MAX_RULES_PER_CHUNK: usize = 100_000;
+
+fn chunk_rules_json(json: &str) -> Vec<String> {
+    let rules: Vec<CbRule> = match serde_json::from_str(json) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[adblock] cannot re-parse rules for chunking: {e}");
+            return vec![json.to_string()];
         }
+    };
+    if rules.len() <= MAX_RULES_PER_CHUNK {
+        return vec![json.to_string()];
     }
-    out
+    rules
+        .chunks(MAX_RULES_PER_CHUNK)
+        .map(|chunk| serde_json::to_string(chunk).unwrap_or_default())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
-/// Download EasyList (blocking network I/O — runs on a background thread).
-fn download_easylist() -> Result<String, String> {
-    for (cmd, args) in [
-        ("curl", vec!["-fsSL", "--max-time", "60", EASYLIST_URL]),
-        ("wget", vec!["-qO-", "-T", "60", EASYLIST_URL]),
-    ] {
-        if let Ok(out) = std::process::Command::new(cmd).args(&args).output() {
-            if out.status.success() && !out.stdout.is_empty() {
-                return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-            }
-        }
-    }
-    Err("could not download EasyList (curl/wget missing or offline)".to_string())
-}
-
-/// Ensure all filter artifacts exist on disk. Returns paths on success.
-fn ensure_filters() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
-    let net = network_json_path();
-    let css_global = cosmetic_global_path();
-    let css_domains = cosmetic_domains_css_path();
-    let list_domains = cosmetic_domains_list_path();
-
-    if net.exists() && css_global.exists() && css_domains.exists() && list_domains.exists() {
-        return Ok((net, css_global, css_domains, list_domains));
-    }
-
-    if let Some(parent) = net.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let text = download_easylist()?;
-    let data = easylist_to_filters(&text);
-
-    std::fs::write(&net, data.network_json.as_bytes())
-        .map_err(|e| format!("cannot write network filters: {e}"))?;
-    std::fs::write(&css_global, data.global_css.as_bytes())
-        .map_err(|e| format!("cannot write global css: {e}"))?;
-    std::fs::write(&css_domains, data.domain_css.as_bytes())
-        .map_err(|e| format!("cannot write domain css: {e}"))?;
-    std::fs::write(&list_domains, data.cosmetic_domains.join("\n"))
-        .map_err(|e| format!("cannot write domain list: {e}"))?;
-
-    Ok((net, css_global, css_domains, list_domains))
-}
-
-// ── Shared state ─────────────────────────────────────────────────────────────
+// ── Shared state (main thread only) ──────────────────────────────────────────
 
 enum State {
     Idle,
@@ -349,9 +200,13 @@ enum State {
     Failed,
 }
 
-/// Compiled network filter + cosmetic style sheets + scriptlets (app lifetime).
+/// Compiled network filters (one per rule chunk) + cosmetic style sheets +
+/// scriptlets (app lifetime).
 struct FilterBundle {
-    filter: *mut c_void,
+    /// One compiled content filter per rule chunk — WebKit caps a single
+    /// store save, so big lists are split. Filters apply in add order and
+    /// later ones win, which preserves the exceptions-last ordering.
+    filters: Vec<*mut c_void>,
     style_sheets: Vec<*mut c_void>,
     user_scripts: Vec<*mut c_void>,
 }
@@ -364,6 +219,44 @@ thread_local! {
 /// per webview right after creation. If the filter isn't ready yet, the
 /// manager is queued and filters are attached when loading finishes.
 pub fn attach_to_webview(wv_ptr: *mut ffi::WebKitWebView) {
+    unsafe {
+        ffi::g_signal_connect_data(
+            wv_ptr as *mut ffi::GObject,
+            c"decide-policy".as_ptr(),
+            Some(std::mem::transmute(
+                policy_decide_trampoline as unsafe extern "C" fn(
+                    *mut ffi::WebKitWebView,
+                    *mut c_void, // WebKitPolicyDecision
+                    c_uint,      // decision type (POLICY_DECISION_TYPE_*)
+                    *mut c_void,
+                ),
+            )),
+            std::ptr::null_mut(),
+            None,
+            0,
+        );
+    }
+
+    // Auto-deny notification permission requests — sites push ads through
+    // them and the prompts themselves are an annoyance vector.
+    unsafe {
+        ffi::g_signal_connect_data(
+            wv_ptr as *mut ffi::GObject,
+            c"permission-request".as_ptr(),
+            Some(std::mem::transmute(
+                permission_deny_trampoline
+                    as unsafe extern "C" fn(
+                        *mut ffi::WebKitWebView,
+                        *mut c_void,
+                        *mut c_void,
+                    ) -> i32,
+            )),
+            std::ptr::null_mut(),
+            None,
+            0,
+        );
+    }
+
     let manager = unsafe { ffi::webkit_web_view_get_user_content_manager(wv_ptr) };
     if manager.is_null() {
         return;
@@ -385,9 +278,159 @@ pub fn attach_to_webview(wv_ptr: *mut ffi::WebKitWebView) {
     });
 }
 
+/// Auto-deny every permission request (notifications, geolocation, etc.).
+/// TRUE stops WebKit's default handler (which would show a dialog).
+unsafe extern "C" fn permission_deny_trampoline(
+    _web_view: *mut ffi::WebKitWebView,
+    request: *mut c_void,
+    _data: *mut c_void,
+) -> i32 {
+    unsafe extern "C" {
+        fn webkit_permission_request_deny(request: *mut c_void);
+    }
+    if !request.is_null() {
+        webkit_permission_request_deny(request);
+    }
+    1
+}
+
+/// Engine check on every navigation/response. `decide-policy` fires on the
+/// main thread with the decision type as its third argument; unhandled
+/// decisions are left for WebKit's default behavior.
+unsafe extern "C" fn policy_decide_trampoline(
+    web_view: *mut ffi::WebKitWebView,
+    decision: *mut c_void,
+    decision_type: c_uint,
+    _data: *mut c_void,
+) {
+    handle_policy_decision(web_view, decision, decision_type);
+}
+
+unsafe fn handle_policy_decision(
+    web_view: *mut ffi::WebKitWebView,
+    decision: *mut c_void,
+    decision_type: c_uint,
+) {
+    // Downloads first: a response whose MIME type the view can't render
+    // (zip, pdf attachment, ...) must be answered with `download` or WebKit
+    // never starts one — download-started only fires after this decision.
+    // Checked before the engine so list rules can never swallow a download.
+    if decision_type == ffi::POLICY_DECISION_TYPE_RESPONSE
+        && ffi::webkit_response_policy_decision_is_mime_type_supported(decision) == 0
+    {
+        if let Some(dl_uri) = decision_uri(decision, decision_type) {
+            eprintln!("[download] policy: {dl_uri}");
+        }
+        ffi::webkit_policy_decision_download(decision);
+        return;
+    }
+
+    let uri = decision_uri(decision, decision_type);
+    let Some(uri) = uri else { return };
+
+    let source = main_frame_uri(web_view).unwrap_or_default();
+
+    // Popups: only NEW_WINDOW_ACTION decisions open a new window. Blocking
+    // script-initiated ones (no user gesture) kills ad popups and popunders
+    // while clicks on links/OAuth buttons pass. Same-frame navigation types
+    // (NAVIGATION_ACTION) are never touched — that's how a window.location
+    // assignment from our own new-tab page gets misread as a popup.
+    if decision_type == ffi::POLICY_DECISION_TYPE_NEW_WINDOW_ACTION {
+        let action = ffi::webkit_navigation_policy_decision_get_navigation_action(decision);
+        if !action.is_null()
+            && unsafe { ffi::webkit_navigation_action_is_user_gesture(action) } == 0
+        {
+            ffi::webkit_policy_decision_ignore(decision);
+            eprintln!("[adblock] blocked popup: {uri}");
+            return;
+        }
+    }
+
+    let is_response = decision_type == ffi::POLICY_DECISION_TYPE_RESPONSE;
+    let request_type = if is_response { "subdocument" } else { "document" };
+
+    let blocked = SHARED.with(|shared| {
+        let state = shared.borrow();
+        let State::Ready(_) = &*state else {
+            return false;
+        };
+        let Some(engine) = engine() else { return false };
+        let Ok(req) = Request::new(&uri, &source, request_type, "GET") else {
+            return false;
+        };
+        // BlockerResult in 0.13: `filter` = matched rule, `exception` =
+        // matched allow-rule. Blocked only when a rule matched and no
+        // exception overrode it.
+        let m = engine.check_network_request(&req);
+        m.exception.is_none() && m.filter.is_some()
+    });
+
+    if blocked {
+        ffi::webkit_policy_decision_ignore(decision);
+        eprintln!("[adblock] blocked request: {uri}");
+    }
+}
+
+/// The compiled engine lives in a global: built once on a background thread,
+/// then only ever read from the main thread. `OnceLock` gives us safe
+/// cross-thread publication; reads take a short lock-free hit only until the
+/// engine is swapped in.
+static ENGINE: std::sync::OnceLock<adblock::Engine> = std::sync::OnceLock::new();
+
+fn engine() -> Option<&'static adblock::Engine> {
+    ENGINE.get()
+}
+
+unsafe fn decision_uri(decision: *mut c_void, decision_type: c_uint) -> Option<String> {
+    let request = if decision_type == ffi::POLICY_DECISION_TYPE_RESPONSE {
+        ffi::webkit_response_policy_decision_get_request(decision)
+    } else {
+        let action = ffi::webkit_navigation_policy_decision_get_navigation_action(decision);
+        if action.is_null() {
+            return None;
+        }
+        ffi::webkit_navigation_action_get_request(action)
+    };
+    if request.is_null() {
+        return None;
+    }
+    let uri = ffi::webkit_uri_request_get_uri(request);
+    if uri.is_null() {
+        None
+    } else {
+        Some(
+            std::ffi::CStr::from_ptr(uri)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+unsafe fn main_frame_uri(web_view: *mut ffi::WebKitWebView) -> Option<String> {
+    let resource = ffi::webkit_web_view_get_main_resource(web_view);
+    if resource.is_null() {
+        return None;
+    }
+    unsafe extern "C" {
+        fn webkit_web_resource_get_uri(resource: *mut c_void) -> *const std::os::raw::c_char;
+    }
+    let uri = webkit_web_resource_get_uri(resource);
+    if uri.is_null() {
+        None
+    } else {
+        Some(
+            std::ffi::CStr::from_ptr(uri)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
 unsafe fn apply_bundle(bundle: &FilterBundle, manager: *mut c_void) {
-    if !bundle.filter.is_null() {
-        ffi::webkit_user_content_manager_add_filter(manager, bundle.filter);
+    for filter in &bundle.filters {
+        if !filter.is_null() {
+            ffi::webkit_user_content_manager_add_filter(manager, *filter);
+        }
     }
     for sheet in &bundle.style_sheets {
         ffi::webkit_user_content_manager_add_style_sheet(manager, *sheet);
@@ -399,25 +442,141 @@ unsafe fn apply_bundle(bundle: &FilterBundle, manager: *mut c_void) {
 
 fn start_download() {
     std::thread::spawn(|| {
-        let paths = ensure_filters();
+        let lists = ensure_lists();
         gtk4::glib::MainContext::default().invoke(move || {
-            load_into_store(paths);
+            load_into_store(lists);
         });
     });
 }
 
-/// GAsyncReadyCallback: the source object IS the filter store.
+/// Download (or reuse cached) all filter lists, concatenated. Blocking
+/// network I/O — background thread only. A list that fails to download is
+/// skipped with a warning as long as at least one list is available.
+fn ensure_lists() -> Result<String, String> {
+    let mut combined = String::new();
+    let mut loaded = 0usize;
+    let mut last_err = String::new();
+
+    for list in FILTER_LISTS {
+        let cache = list_cache_path(list.name);
+        let text = match std::fs::read_to_string(&cache) {
+            Ok(t) if list_text_looks_valid(&t) => t,
+            _ => match download_list(list.url) {
+                Ok(t) => {
+                    if let Some(parent) = cache.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::write(&cache, t.as_bytes()) {
+                        eprintln!("[adblock] cannot cache {}: {e}", list.name);
+                    }
+                    t
+                }
+                Err(e) => {
+                    eprintln!("[adblock] list {} unavailable: {e}", list.name);
+                    last_err = e;
+                    continue;
+                }
+            },
+        };
+        let rules = text.lines().count();
+        eprintln!("[adblock] list ready: {} ({rules} lines)", list.name);
+        combined.push_str(&text);
+        combined.push('\n');
+        loaded += 1;
+    }
+
+    if loaded == 0 {
+        return Err(last_err);
+    }
+    Ok(combined)
+}
+
+fn download_list(url: &str) -> Result<String, String> {
+    for (cmd, args) in [
+        ("curl", vec!["-fsSL", "--max-time", "60", url]),
+        ("wget", vec!["-qO-", "-T", "60", url]),
+    ] {
+        if let Ok(out) = std::process::Command::new(cmd).args(&args).output() {
+            if out.status.success() && !out.stdout.is_empty() {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                if list_text_looks_valid(&text) {
+                    return Ok(text);
+                }
+            }
+        }
+    }
+    Err(format!("could not download {url} (curl/wget missing, offline, or source served a template/stub)"))
+}
+
+/// GAsyncReadyCallback: the source object IS the filter store. Drives the
+/// chunk pipeline: collect this chunk's filter, save the next chunk, or hand
+/// the full bundle over when all chunks are done.
 unsafe extern "C" fn load_trampoline(
     store: *mut ffi::GObject,
     result: *mut c_void,
-    _data: *mut c_void,
+    data: *mut c_void,
 ) {
-    finish_load(store as *mut c_void, result);
+    let mut err: *mut ffi::GError = std::ptr::null_mut();
+    let filter = ffi::webkit_user_content_filter_store_save_from_file_finish(
+        store as *mut c_void,
+        result,
+        &mut err,
+    );
+
+    let ctx = &mut *(data as *mut CompileCtx);
+
+    if filter.is_null() {
+        let msg = if err.is_null() {
+            "unknown error".to_string()
+        } else {
+            std::ffi::CStr::from_ptr((*err).message).to_string_lossy().into_owned()
+        };
+        eprintln!("[adblock] filter compile failed: {msg}");
+        // A chunk that fails leaves the rule set incomplete — partial filters
+        // would break the exceptions-last ordering, so compile nothing.
+        cleanup_compile(data);
+        SHARED.with(|s| *s.borrow_mut() = State::Failed);
+        return;
+    }
+
+    ctx.filters.push(filter);
+    ctx.index += 1;
+    if ctx.index < ctx.chunks.len() {
+        start_chunk_save(data);
+        return;
+    }
+
+    // All chunks compiled — take ownership and hand over the bundle.
+    let mut ctx = Box::from_raw(data as *mut CompileCtx);
+    let filter_count = ctx.filters.len();
+    let bundle = FilterBundle {
+        filters: std::mem::take(&mut ctx.filters),
+        style_sheets: STAGED_SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        user_scripts: STAGED_SCRIPTS.with(|s| std::mem::take(&mut *s.borrow_mut())),
+    };
+
+    SHARED.with(|shared| {
+        let mut state = shared.borrow_mut();
+        match std::mem::replace(&mut *state, State::Failed) {
+            State::Loading(pending) => {
+                for manager in &pending {
+                    apply_bundle(&bundle, *manager);
+                }
+            }
+            other => {
+                *state = other;
+            }
+        }
+        *state = State::Ready(bundle);
+    });
+    eprintln!(
+        "[adblock] EasyList compiled & active ({filter_count} filter(s) + engine + cosmetic + scriptlets)",
+    );
 }
 
-fn load_into_store(paths: Result<(PathBuf, PathBuf, PathBuf, PathBuf), String>) {
-    let (net, css_global, css_domains, list_domains) = match paths {
-        Ok(p) => p,
+fn load_into_store(lists: Result<String, String>) {
+    let easylist = match lists {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("[adblock] disabled: {e}");
             SHARED.with(|s| *s.borrow_mut() = State::Failed);
@@ -425,155 +584,170 @@ fn load_into_store(paths: Result<(PathBuf, PathBuf, PathBuf, PathBuf), String>) 
         }
     };
 
+    // 1. Build the live engine for decide-policy checks (once per process).
+    let all_rules = augment_lists(&easylist);
+    if ENGINE.get().is_none() {
+        let mut set = FilterSet::new(false);
+        set.add_filter_list(all_rules.clone(), ParseOptions::default());
+        let engine = adblock::Engine::new_with_filter_set(set);
+        let _ = ENGINE.set(engine);
+        eprintln!("[adblock] engine ready (decide-policy layer active)");
+    }
+
+    // 2. Engine conversion → WebKit content-blocker JSON (cached on disk).
+    let rules_source = all_rules;
+    let rules_json = match std::fs::read_to_string(rules_cache_path()) {
+        Ok(json) if !json.trim().is_empty() => Some(json),
+        _ => {
+            let json = build_rules(&rules_source);
+            if let Some(json) = &json {
+                let path = rules_cache_path();
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, json.as_bytes());
+            }
+            json
+        }
+    };
+
+    // 2. Build cosmetic style sheets + scriptlets (independent of compile).
+    unsafe { build_style_sheets(&easylist) };
+    let scripts = unsafe { build_scriptlets() };
+    STAGED_SCRIPTS.with(|s| *s.borrow_mut() = scripts);
+
+    // 3. Compile the JSON into the store (async) and hand the filter over.
+    let Some(json) = rules_json else {
+        eprintln!("[adblock] engine produced no convertible rules");
+        SHARED.with(|s| {
+            let mut st = s.borrow_mut();
+            let sheets = STAGED_SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+            if !sheets.is_empty() {
+                *st = State::Ready(FilterBundle {
+                    filters: Vec::new(),
+                    style_sheets: sheets,
+                    user_scripts: STAGED_SCRIPTS.with(|s| std::mem::take(&mut *s.borrow_mut())),
+                });
+            } else {
+                *st = State::Failed;
+            }
+        });
+        return;
+    };
+
+    // 3. Compile the JSON into the store (async), one chunk per save —
+    // WebKit rejects a single save over its per-file rule cap.
+    let chunks = chunk_rules_json(&json);
+    if chunks.is_empty() {
+        eprintln!("[adblock] chunking produced no rule files");
+        SHARED.with(|s| *s.borrow_mut() = State::Failed);
+        return;
+    }
+    eprintln!(
+        "[adblock] compiling {} rule chunk(s) from {}",
+        chunks.len(),
+        rules_cache_path().display()
+    );
+
     let store_dir = filter_store_dir();
     let _ = std::fs::create_dir_all(&store_dir);
 
-    unsafe {
-        let c_dir = std::ffi::CString::new(store_dir.to_string_lossy().as_ref()).unwrap();
-        let store = ffi::webkit_user_content_filter_store_new(c_dir.as_ptr());
-        // `store` is intentionally leaked — lives for the app lifetime.
+    let c_dir =
+        std::ffi::CString::new(store_dir.to_string_lossy().as_ref()).unwrap();
+    let store = unsafe { ffi::webkit_user_content_filter_store_new(c_dir.as_ptr()) };
+    // `store` is intentionally leaked — lives for the app lifetime.
 
-        // Compile the JSON rules into the store (persists a binary filter).
-        let c_path = std::ffi::CString::new(net.to_string_lossy().as_ref()).unwrap();
-        let file = ffi::g_file_new_for_path(c_path.as_ptr());
-        let c_id = std::ffi::CString::new(FILTER_ID).unwrap();
+    let ctx = Box::new(CompileCtx { store, chunks, index: 0, filters: Vec::new() });
+    let data = Box::into_raw(ctx) as *mut c_void;
 
-        ffi::webkit_user_content_filter_store_save_from_file(
-            store,
-            c_id.as_ptr(),
-            file,
-            std::ptr::null_mut(),
-            Some(load_trampoline),
-            std::ptr::null_mut(),
-        );
-    }
-
-    // Build cosmetic style sheets (independent of the async compile above).
-    unsafe { build_style_sheets(&css_global, &css_domains, &list_domains) };
+    // Kick off the first save; load_trampoline drives the rest.
+    unsafe { start_chunk_save(data) };
 }
 
-unsafe fn build_style_sheets(
-    css_global: &PathBuf,
-    css_domains: &PathBuf,
-    list_domains: &PathBuf,
-) {
-    let mut sheets: Vec<*mut c_void> = Vec::new();
+/// State for the multi-chunk compile: chunks left to save + filters already
+/// compiled, in order. Freed in load_trampoline when compilation ends.
+struct CompileCtx {
+    store: *mut c_void,
+    chunks: Vec<String>,
+    index: usize,
+    filters: Vec<*mut c_void>,
+}
 
-    if let Ok(css) = std::fs::read_to_string(css_global) {
-        if !css.trim().is_empty() {
-            if let Some(s) = make_style_sheet(&css, &[]) {
-                sheets.push(s);
+/// Save chunk `ctx.index` to the store under a unique id.
+unsafe fn start_chunk_save(data: *mut c_void) {
+    let ctx = &mut *(data as *mut CompileCtx);
+    let json = &ctx.chunks[ctx.index];
+    let tmp = rules_cache_path()
+        .with_extension(format!("chunk{}-compile.json", ctx.index));
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        eprintln!("[adblock] cannot write rules chunk {} for compilation", ctx.index);
+        cleanup_compile(data);
+        SHARED.with(|s| *s.borrow_mut() = State::Failed);
+        return;
+    }
+
+    let c_path = std::ffi::CString::new(tmp.to_string_lossy().as_ref()).unwrap();
+    let file = ffi::g_file_new_for_path(c_path.as_ptr());
+    let c_id =
+        std::ffi::CString::new(format!("{}-c{}", FILTER_ID, ctx.index)).unwrap();
+
+    ffi::webkit_user_content_filter_store_save_from_file(
+        ctx.store,
+        c_id.as_ptr(),
+        file,
+        std::ptr::null_mut(),
+        Some(load_trampoline),
+        data,
+    );
+}
+
+/// Free the compile state (and any compiled filters not yet handed over).
+unsafe fn cleanup_compile(data: *mut c_void) {
+    if data.is_null() {
+        return;
+    }
+    let ctx = Box::from_raw(data as *mut CompileCtx);
+    for f in ctx.filters {
+        ffi::webkit_user_content_filter_unref(f);
+    }
+}
+
+unsafe fn build_style_sheets(easylist: &str) {
+    // Global element-hiding selectors, straight from the list (## rules
+    // without a domain prefix). The engine's content-blocker export already
+    // carries domain-qualified cosmetic rules, so only the global ones are
+    // duplicated here.
+    let mut global_selectors: Vec<String> = Vec::new();
+    for line in easylist.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
+            continue;
+        }
+        if line.contains("#@#") {
+            continue; // exception hiding — do not hide
+        }
+        if let Some((lhs, rhs)) = line.split_once("##") {
+            if lhs.trim().is_empty() {
+                let selector = rhs.trim();
+                if !selector.is_empty() && global_selectors.len() < 3000 {
+                    global_selectors.push(selector.to_string());
+                }
             }
         }
     }
 
-    if let (Ok(css), Ok(list)) = (
-        std::fs::read_to_string(css_domains),
-        std::fs::read_to_string(list_domains),
-    ) {
-        if !css.trim().is_empty() {
-            let globs: Vec<String> = list
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(String::from)
-                .collect();
-            let c_globs: Vec<std::ffi::CString> =
-                globs.iter().map(|g| std::ffi::CString::new(g.as_str()).unwrap()).collect();
-            let ptrs: Vec<*const std::os::raw::c_char> =
-                c_globs.iter().map(|g| g.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-            if let Some(s) = make_style_sheet(&css, &ptrs) {
-                sheets.push(s);
-            }
+    let mut sheets: Vec<*mut c_void> = Vec::new();
+    if !global_selectors.is_empty() {
+        let joined = global_selectors.join(",\n");
+        let css = format!(
+            "{joined} {{ display: none !important; visibility: hidden !important; }}\n"
+        );
+        if let Some(s) = make_style_sheet(&css, &[]) {
+            sheets.push(s);
         }
     }
 
     STAGED_SHEETS.with(|s| *s.borrow_mut() = sheets);
-
-    STAGED_SCRIPTS.with(|s| *s.borrow_mut() = build_scriptlets());
-}
-
-/// JS scriptlets — uBlock-style injected scripts for players that serve ads
-/// from the video CDN itself (YouTube), where network rules are useless.
-unsafe fn build_scriptlets() -> Vec<*mut c_void> {
-    // Runs at document-start on youtube.com: hardens the player against the
-    // ad pipeline. The player's ad module is patched to instantly skip any
-    // ad playback, and ad UI is removed from the DOM as it appears.
-    const YT_AD_KILLER: &str = r#"
-(function () {
-    if (window.__lbAdKill) return; window.__lbAdKill = true;
-
-    var css = document.createElement('style');
-    css.textContent = [
-        '.ytp-ad-module,', '.ytp-ad-player-overlay,', '.ytp-ad-text,',
-        '.ytp-ad-image,', '.ytp-ad-video,', '.ytp-ad-preview-container',
-        '.ytp-ad-action-interstitial,', '.ytp-ad-message-container,',
-        'ytd-promoted-sparkles-web-renderer,', 'ytd-promoted-video-renderer,',
-        'ytd-compact-promoted-video-renderer,', 'ytd-ad-slot-renderer,',
-        '#player-ads,', 'ytd-in-feed-ad-layout-renderer,',
-        'ytd-banner-promo-renderer,', 'ytd-statement-banner-renderer,',
-        'ytd-rich-item-renderer[data-ad],',
-        'tp-yt-paper-dialog.ytd-popup-container ytd-mealbar-promo-renderer'
-    ].join(', '), ' { display: none !important; }'].join('');
-    (document.head || document.documentElement).appendChild(css);
-
-    function skipAds(player) {
-        try {
-            // Kill the ad module state machine.
-            if (player.getPlayerResponse) {
-                var pr = player.getPlayerResponse();
-                if (pr && pr.adPlacements) delete pr.adPlacements;
-                if (pr && pr.adSlots) delete pr.adSlots;
-            }
-            // Any adBreak must end immediately.
-            if (player.isAdShowing && player.isAdShowing()) {
-                if (player.stopVideo) player.stopVideo();
-                if (player.seekTo && player.getDuration) {
-                    player.seekTo(player.getDuration() || 0, true);
-                }
-                if (player.closeSlardarAdBreaks) player.closeSlardarAdBreaks();
-                if (player.playerResponse && player.playerResponse.adPlacements) {
-                    delete player.playerResponse.adPlacements;
-                }
-                var v = document.querySelector('video.html5-main-video');
-                if (v && v.src) { try { v.src = ''; } catch (e) {} }
-            }
-        } catch (e) {}
-    }
-
-    function tick() {
-        var player = document.getElementById('movie_player');
-        if (player) skipAds(player);
-    }
-
-    setInterval(tick, 300);
-    document.addEventListener('load', tick, true);
-})();
-"#;
-
-    let mut scripts = Vec::new();
-    let allow = [c"*://www.youtube.com/*", c"*://m.youtube.com/*", c"*://youtube.com/*"];
-    let allow_ptrs: Vec<*const std::os::raw::c_char> =
-        allow.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-
-    let c_js = std::ffi::CString::new(YT_AD_KILLER).unwrap();
-    // 0 = ALL_FRAMES; injection_time 0 = document-start.
-    let script = ffi::webkit_user_script_new(
-        c_js.as_ptr(),
-        0,
-        0,
-        allow_ptrs.as_ptr(),
-        std::ptr::null(),
-    );
-    if !script.is_null() {
-        scripts.push(script);
-    }
-    scripts
-}
-
-thread_local! {
-    static STAGED_SHEETS: RefCell<Vec<*mut c_void>> = const { RefCell::new(Vec::new()) };
-    static STAGED_SCRIPTS: RefCell<Vec<*mut c_void>> = const { RefCell::new(Vec::new()) };
 }
 
 unsafe fn make_style_sheet(
@@ -600,114 +774,228 @@ unsafe fn make_style_sheet(
     }
 }
 
-unsafe fn finish_load(store: *mut c_void, result: *mut c_void) {
-    let mut err: *mut ffi::GError = std::ptr::null_mut();
-    let filter =
-        ffi::webkit_user_content_filter_store_save_from_file_finish(store, result, &mut err);
+/// JS scriptlets — uBlock-style injected scripts for players that serve ads
+/// from the video CDN itself (YouTube), where network rules are useless.
+///
+/// The key technique is uBO's `json-prune adPlacements adSlots`: hook
+/// `JSON.parse` at document-start and strip ad scheduling out of every
+/// payload BEFORE the player sees it. The old approach deleted those fields
+/// after the ad module had already read them — too late.
+fn yt_user_script_source() -> &'static str {
+    r#"
+(function () {
+    if (window.__lbAdKill) return; window.__lbAdKill = true;
 
-    if filter.is_null() {
-        let msg = if err.is_null() {
-            "unknown error".to_string()
-        } else {
-            std::ffi::CStr::from_ptr((*err).message)
-                .to_string_lossy()
-                .into_owned()
-        };
-        eprintln!("[adblock] filter compile failed: {msg}");
-        SHARED.with(|s| {
-            let mut st = s.borrow_mut();
-            // Cosmetic sheets may still work even if compile failed.
-            let sheets = STAGED_SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut()));
-            if !sheets.is_empty() {
-                *st = State::Ready(FilterBundle {
-                    filter: std::ptr::null_mut(),
-                    style_sheets: sheets,
-                    user_scripts: STAGED_SCRIPTS
-                        .with(|s| std::mem::take(&mut *s.borrow_mut())),
-                });
-            } else {
-                *st = State::Failed;
-            }
-        });
-        return;
+    // ---- 1. json-prune: strip ad data from every JSON payload the page
+    // parses. The player never learns an ad was scheduled. (Same technique
+    // as uBO's json-prune — parsed data only, player API untouched.)
+    var PRUNE_KEYS = ['adPlacements', 'adSlots', 'auxiliaryUi'];
+    var nativeParse = JSON.parse;
+    JSON.parse = function () {
+        var obj = nativeParse.apply(this, arguments);
+        try { prune(obj, 0); } catch (e) {}
+        return obj;
+    };
+    function prune(obj, depth) {
+        if (!obj || typeof obj !== 'object' || depth > 8) return;
+        for (var k in obj) {
+            if (PRUNE_KEYS.indexOf(k) !== -1) { delete obj[k]; continue; }
+            var v = obj[k];
+            if (v && typeof v === 'object') prune(v, depth + 1);
+        }
     }
 
-    let mut bundle = FilterBundle {
-        filter,
-        style_sheets: Vec::new(),
-        user_scripts: STAGED_SCRIPTS.with(|s| std::mem::take(&mut *s.borrow_mut())),
-    };
+    // ---- 2. Hide ad UI (CSS only — never remove player-owned nodes; the
+    // player keeps references into its own DOM and breaks when they vanish).
+    var AD_UI = [
+        '.ytp-ad-module', '.ytp-ad-player-overlay', '.ytp-ad-text',
+        '.ytp-ad-image', '.ytp-ad-video', '.ytp-ad-preview-container',
+        '.ytp-ad-action-interstitial', '.ytp-ad-message-container',
+        'ytd-promoted-sparkles-web-renderer', 'ytd-promoted-video-renderer',
+        'ytd-compact-promoted-video-renderer', 'ytd-ad-slot-renderer',
+        '#player-ads', 'ytd-in-feed-ad-layout-renderer',
+        'ytd-banner-promo-renderer', 'ytd-statement-banner-renderer',
+        'tp-yt-paper-dialog.ytd-popup-container ytd-mealbar-promo-renderer'
+    ].join(',');
+    var css = document.createElement('style');
+    css.textContent = AD_UI + ' { display: none !important; }';
+    (document.head || document.documentElement).appendChild(css);
 
-    SHARED.with(|shared| {
-        let mut state = shared.borrow_mut();
-        match std::mem::replace(&mut *state, State::Failed) {
-            State::Loading(pending) => {
-                bundle.style_sheets =
-                    STAGED_SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut()));
-                for manager in &pending {
-                    apply_bundle(&bundle, *manager);
-                }
-                *state = State::Ready(bundle);
-            }
-            other => {
-                *state = other;
-            }
-        }
-    });
-    eprintln!("[adblock] EasyList compiled & active (network + cosmetic + scriptlets)");
+    // ---- 3. Auto-click "Skip" if YouTube still shows one. Never drive the
+    // player API from here — yanking playback mid-stream is what makes it
+    // die with "Something went wrong".
+    function tick() {
+        var skip = document.querySelector(
+            '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
+        if (skip) { try { skip.click(); } catch (e) {} }
+    }
+    setInterval(tick, 500);
+    new MutationObserver(tick).observe(document.documentElement,
+        { childList: true, subtree: true });
+})();
+"#
+}
+
+unsafe fn build_scriptlets() -> Vec<*mut c_void> {
+    let mut scripts = Vec::new();
+    let allow = [c"*://www.youtube.com/*", c"*://m.youtube.com/*", c"*://youtube.com/*"];
+    let allow_ptrs: Vec<*const std::os::raw::c_char> =
+        allow.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+
+    let c_js = std::ffi::CString::new(yt_user_script_source()).unwrap();
+    // 0 = ALL_FRAMES; injection_time 0 = document-start.
+    let script = ffi::webkit_user_script_new(
+        c_js.as_ptr(),
+        0,
+        0,
+        allow_ptrs.as_ptr(),
+        std::ptr::null(),
+    );
+    if !script.is_null() {
+        scripts.push(script);
+    }
+    scripts
+}
+
+thread_local! {
+    static STAGED_SHEETS: RefCell<Vec<*mut c_void>> = const { RefCell::new(Vec::new()) };
+    static STAGED_SCRIPTS: RefCell<Vec<*mut c_void>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const SAMPLE: &str = "\
+! EasyList sample
+||doubleclick.net^
+/ads/banner.js
+@@||good.example.com^$document
+bannersite.com##.ad
+##.tracker, .pixel
+#@#.keepme
+example.com/ads/*banner
+||googlesyndication.com^$third-party,script
+||ads.example.com^$domain=foo.com|bar.com
+google.*##.ad-slot
+example.com##+js(abort-on-property-read, x)
+example.com##.ad:has(.inner)
+";
+
     #[test]
-    fn converts_basic_rules() {
-        let data = easylist_to_filters(
-            "! comment\n||doubleclick.net^\n/ads/banner.js\n@@||good.example.com^$document\nbannersite.com##.ad\n##.tracker, .pixel\n#@#.keepme\n",
+    fn converted_rules_are_valid_json() {
+        let json = build_rules(SAMPLE).expect("rules should convert");
+        let parsed: Vec<CbRule> = serde_json::from_str(&json).expect("valid WebKit JSON");
+        assert!(!parsed.is_empty());
+    }
+
+    #[test]
+    fn blocks_known_ad_and_allows_exceptions() {
+        let json = build_rules(SAMPLE).expect("rules should convert");
+        let rules: Vec<CbRule> = serde_json::from_str(&json).unwrap();
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.action.selector.as_deref().unwrap_or("").contains(".tracker")),
+            "global cosmetic selector should be exported"
         );
-        // Network rules
-        assert!(data.network_json.contains(r#""url-filter":"/ads/banner\\.js""#));
-        assert!(data.network_json.contains(r#""action":{"type":"block"}"#));
-        assert!(data.network_json.contains(r#""action":{"type":"ignore-previous-rules"}"#));
-        // `^` becomes a separator class, not a dead anchor
-        assert!(data
-            .network_json
-            .contains(r#""url-filter":"doubleclick\\.net([^a-zA-Z0-9._%+-]|$)""#));
-        // Cosmetic rule lands as css-display-none (hide), NEVER as a block —
-        // a domain-level block would take out the whole site.
-        assert!(data
-            .network_json
-            .contains(r#""action":{"type":"css-display-none""#));
-        assert!(data.network_json.contains(r#""if-domain":["*bannersite.com"]"#));
-        assert!(!data
-            .network_json
-            .contains(r#""action":{"type":"block"},"trigger":{"url-filter":"bannersite"#));
-        // Cosmetic selectors landed in the CSS layer
-        assert!(data.domain_css.contains(".ad"));
-        assert!(data
-            .cosmetic_domains
-            .iter()
-            .any(|g| g.contains("bannersite.com")));
-        // Exception hiding rule `#@#` is ignored entirely
-        assert!(!data.domain_css.contains(".keepme"));
-        // Global selectors
-        assert!(data.global_css.contains(".tracker"));
+
+        // Engine path: same rules via the engine, so decide-policy blocking
+        // is what the runtime uses.
+        let mut set = FilterSet::new(true);
+        set.add_filter_list(SAMPLE.to_string(), ParseOptions::default());
+        let engine = adblock::Engine::new_with_filter_set(set);
+
+        let blocked = |url: &str, source: &str, ty: &str| {
+            let req = Request::new(url, source, ty, "GET").unwrap();
+            let m = engine.check_network_request(&req);
+            m.exception.is_none() && m.filter.is_some()
+        };
+
+        assert!(blocked(
+            "https://ad.doubleclick.net/ddm/adj/x",
+            "https://news.example.com/",
+            "script"
+        ));
+        // Third-party script rule from the sample list.
+        assert!(blocked(
+            "https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js",
+            "https://news.example.com/",
+            "script"
+        ));
+        // `$domain=` restriction: blocks on the listed domains only.
+        assert!(blocked("https://ads.example.com/x.js", "https://foo.com/", "script"));
+        assert!(!blocked("https://ads.example.com/x.js", "https://other.com/", "script"));
+        // The engine never blocks main-document loads, and the `@@` exception
+        // must surface as an allow rather than a block.
+        assert!(!blocked(
+            "https://good.example.com/page",
+            "https://good.example.com/page",
+            "document"
+        ));
+        assert!(blocked(
+            "https://cdn.example.com/ads/banner.js",
+            "https://news.example.com/",
+            "script"
+        ));
+        assert!(blocked(
+            "https://example.com/ads/superbanner.js",
+            "https://example.com/",
+            "script"
+        ));
     }
 
     #[test]
-    fn wildcard_and_separator() {
-        let data = easylist_to_filters("example.com/ads/*banner\n");
-        assert!(data.network_json.contains(r#"ads/.*banner"#));
+    fn augment_puts_exceptions_last() {
+        let out = augment_lists("||ads.example.com^\n");
+        let block_pos = out.find("||ads.example.com^").unwrap();
+        let allow_pos = out.find("@@||youtube.com/api/").unwrap();
+        assert!(block_pos < allow_pos, "exceptions must come after blocks");
     }
-}
 
-#[cfg(test)]
-mod debug_tmp {
-    use super::*;
     #[test]
-    fn print_json() {
-        let d = easylist_to_filters("||doubleclick.net^\n");
-        eprintln!("JSON: {}", d.network_json);
+    fn chunking_splits_big_rulesets_and_keeps_exceptions_last() {
+        let rules: Vec<CbRule> = (0..(MAX_RULES_PER_CHUNK + 500))
+            .map(|i| {
+                let json = format!(
+                    r#"{{"trigger":{{"url-filter":"host{i}.example"}},"action":{{"type":"block"}}}}"#
+                );
+                serde_json::from_str(&json).unwrap()
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&rules).unwrap();
+
+        let chunks = chunk_rules_json(&json);
+        assert_eq!(chunks.len(), 2, "oversized ruleset must split into 2 saves");
+        for chunk in &chunks {
+            let parsed: Vec<CbRule> =
+                serde_json::from_str(chunk).expect("chunk is valid WebKit JSON");
+            assert!(parsed.len() <= MAX_RULES_PER_CHUNK);
+        }
+        // Order is preserved across the boundary (exceptions-last guarantee).
+        let first: Vec<CbRule> = serde_json::from_str(&chunks[0]).unwrap();
+        let last: Vec<CbRule> = serde_json::from_str(&chunks[1]).unwrap();
+        assert_eq!(first[0].trigger.url_filter, "host0.example");
+        assert_eq!(last.last().unwrap().trigger.url_filter, "host100499.example");
+
+        // Small rulesets stay as a single unmodified file.
+        let small = chunk_rules_json(r#"[]"#);
+        assert_eq!(small.len(), 1);
+    }
+
+    #[test]
+    fn yt_scriptlet_targets_player_ads() {
+        let js = yt_user_script_source();
+        assert!(js.contains("adPlacements"));
+        // json-prune must hook at document-start, before the player parses.
+        assert!(js.contains("JSON.parse"));
+        // The watchdog that force-stops the player is gone: calling
+        // stopVideo()/seekTo() mid-playback kills the player with
+        // "Something went wrong".
+        assert!(!js.contains("stopVideo"));
+        assert!(!js.contains("seekTo"));
+        // Ad UI is hidden with CSS, never removed from the player's DOM.
+        assert!(js.contains("display: none"));
+        assert!(!js.contains("el.remove()"));
     }
 }
