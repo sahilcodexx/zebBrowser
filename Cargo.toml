@@ -8,6 +8,15 @@ license = "MIT"
 
 [dependencies]
 gtk4 = "0.10"
+# single-thread is disabled: the engine is built on a background thread and
+# queried from the main thread, which requires Send + Sync.
+adblock = { version = "0.13", default-features = false, features = [
+    "content-blocking",
+    "embedded-domain-resolver",
+    "full-regex-handling",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [build-dependencies]
 pkg-config = "0.3"
