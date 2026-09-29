@@ -1,5 +1,7 @@
 //! Minimal browser configuration.
 
+use std::path::PathBuf;
+
 pub const APP_ID: &str = "com.example.LightBrowser";
 pub const APP_NAME: &str = "Light Browser";
 
@@ -208,6 +210,105 @@ pub const NEW_TAB_HTML: &str = r#"<!DOCTYPE html>
   </script>
 </body>
 </html>"#;
+
+// ── User settings (persisted JSON) ──────────────────────────────────────────
+
+/// Persisted user preferences. Missing fields fall back to defaults so a
+/// settings file from an older build keeps loading.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Settings {
+    /// Where downloads are saved. Empty → XDG_DOWNLOAD_DIR / ~/Downloads.
+    #[serde(default)]
+    pub download_dir: String,
+    /// Ask where to save each download (folder picker per download).
+    #[serde(default)]
+    pub ask_download_location: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            download_dir: String::new(),
+            ask_download_location: false,
+        }
+    }
+}
+
+fn settings_path() -> PathBuf {
+    crate::adblock::data_dir_shared().join("settings.json")
+}
+
+/// Load persisted settings, or defaults when absent/corrupt.
+pub fn load_settings() -> Settings {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Persist settings (best effort — losing a settings write is not fatal).
+pub fn save_settings(settings: &Settings) {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(settings) {
+        let _ = std::fs::write(path, json.as_bytes());
+    }
+}
+
+// ── Download history (persisted) ─────────────────────────────────────────
+
+/// One completed download, kept in downloads.json for the history page.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DownloadEntry {
+    pub name: String,
+    pub dest: String,
+    pub uri: String,
+    /// Unix seconds at completion.
+    pub when: u64,
+}
+
+fn downloads_history_path() -> PathBuf {
+    crate::adblock::data_dir_shared().join("downloads.json")
+}
+
+/// All recorded downloads, oldest first.
+pub fn load_download_entries() -> Vec<DownloadEntry> {
+    std::fs::read_to_string(downloads_history_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_download_entries(entries: &[DownloadEntry]) {
+    let path = downloads_history_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(entries) {
+        let _ = std::fs::write(path, json.as_bytes());
+    }
+}
+
+/// Append a finished download to the persisted history.
+pub fn record_download_entry(entry: DownloadEntry) {
+    let mut all = load_download_entries();
+    all.push(entry);
+    write_download_entries(&all);
+}
+
+/// Remove one entry (matched by destination + timestamp).
+pub fn remove_download_entry(dest: &str, when: u64) {
+    let mut all = load_download_entries();
+    all.retain(|e| !(e.dest == dest && e.when == when));
+    write_download_entries(&all);
+}
+
+/// Wipe the history (files on disk are untouched).
+pub fn clear_download_entries() {
+    write_download_entries(&[]);
+}
 
 /// Error page HTML template. `{uri}` and `{message}` placeholders are substituted.
 pub const ERROR_PAGE_HTML: &str = r#"<!DOCTYPE html>

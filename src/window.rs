@@ -2,6 +2,7 @@
 //! address field, and a blank centered-search new-tab page.
 
 use std::cell::{Cell, RefCell};
+use std::os::raw::c_void;
 use std::rc::{Rc, Weak};
 
 use gtk4::gdk::Key;
@@ -33,7 +34,36 @@ pub enum WinCmd {
     TogglePin,
     OpenBrowserMenu,
     OpenSettings,
+    FindOpen,
+    FindNext,
+    FindPrev,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ToggleFullscreen,
 }
+
+/// One active download, tracked for the bottom-bar progress pill.
+struct ActiveDownload {
+    id: u64,
+    name: String,
+    dest: String,
+    /// Strong ref (taken at download-started, released at every removal
+    /// site). `download-started` only loans the object — stashing the raw
+    /// pointer while we poll it every 400ms is a use-after-free and shows up
+    /// as heap corruption once WebKit finalizes the download.
+    download: *mut ffi::WebKitDownload,
+}
+
+/// Widgets kept alive for the bottom-right download card, so each poll tick
+/// updates text and bar in place instead of rebuilding the overlay.
+struct DownloadPill {
+    root: GtkBox,
+    title: Label,
+    meta: Label,
+    bar: ProgressBar,
+}
+
 
 /// Theme preferences supported by the browser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +83,10 @@ pub struct BrowserWindow {
     pub window: ApplicationWindow,
     pub address: gtk4::Entry,
     sidebar_address: gtk4::Entry,
+    /// Sidebar navigation row (hidden in Topbar layout).
+    sidebar_nav_back: Button,
+    sidebar_nav_forward: Button,
+    sidebar_nav_reload: Button,
     pub progress: ProgressBar,
     pub stack: Stack,
     pub tab_strip: GtkBox,
@@ -81,6 +115,43 @@ pub struct BrowserWindow {
     tabs: RefCell<Vec<Rc<Tab>>>,
     current: RefCell<Option<Rc<Tab>>>,
     self_weak: Weak<Self>,
+    /// Live downloads, for the bottom-bar progress pill.
+    downloads: RefCell<Vec<ActiveDownload>>,
+    next_download_id: Cell<u64>,
+    /// Sidebar/downloads-button badge: total completed downloads this session.
+    completed_downloads: Cell<u64>,
+    /// Live popover, if open — refreshed on progress ticks.
+    downloads_popover: RefCell<Option<gtk4::Popover>>,
+    /// Popover rows container (rebuilt on progress ticks while open).
+    downloads_popover_rows: RefCell<Option<GtkBox>>,
+    /// Open full-page downloads view (native overlay), if shown.
+    active_downloads_page: RefCell<Option<GtkBox>>,
+    /// Row container inside the open downloads page.
+    downloads_page_list: RefCell<Option<GtkBox>>,
+    /// Search box inside the open downloads page.
+    downloads_page_search: RefCell<Option<gtk4::Entry>>,
+    /// Persistent pill shown while any download is active.
+    download_pill: RefCell<Option<DownloadPill>>,
+    /// Open "Save Download" dialogs by download id, kept alive so a dropped
+    /// visible dialog can't be a use-after-free, and closed automatically if
+    /// the download they belong to fails or is cancelled.
+    pending_save_dialogs: RefCell<Vec<(u64, gtk4::FileChooserDialog)>>,
+    /// Persisted user settings (download dir, ask-every-time, ...).
+    settings: RefCell<config::Settings>,
+    /// Downloads button in the sidebar bottom bar (badge updates).
+    downloads_btn: Button,
+    /// Find bar widgets (None until first opened).
+    find_bar: RefCell<Option<FindBar>>,
+    /// Webview in fullscreen video mode.
+    fullscreen: Cell<bool>,
+    /// Window size to restore when leaving fullscreen.
+    pre_fullscreen: Cell<(i32, i32)>,
+}
+
+/// Find-in-page bar state.
+struct FindBar {
+    container: GtkBox,
+    entry: gtk4::Entry,
 }
 
 /// One compact tab pill in the top browser chrome.
@@ -271,6 +342,32 @@ impl BrowserWindow {
         sidebar_traffic.append(&sidebar_zoom_dot);
         sidebar_header.append(&sidebar_traffic);
 
+        // Navigation sits beside the traffic lights — the topbar is hidden
+        // in sidebar layout, so back/forward/reload live up here.
+        let sidebar_nav_box = GtkBox::new(Orientation::Horizontal, 2);
+        sidebar_nav_box.set_css_classes(&["nav-group", "sidebar-nav"]);
+        sidebar_nav_box.set_hexpand(true);
+        sidebar_nav_box.set_valign(gtk4::Align::Center);
+        let sidebar_nav_back = Button::from_icon_name("go-previous-symbolic");
+        sidebar_nav_back.set_size_request(26, 26);
+        sidebar_nav_back.set_tooltip_text(Some("Back (Alt+Left)"));
+        sidebar_nav_back.set_focus_on_click(false);
+        sidebar_nav_back.set_hexpand(true);
+        let sidebar_nav_forward = Button::from_icon_name("go-next-symbolic");
+        sidebar_nav_forward.set_size_request(26, 26);
+        sidebar_nav_forward.set_tooltip_text(Some("Forward (Alt+Right)"));
+        sidebar_nav_forward.set_focus_on_click(false);
+        sidebar_nav_forward.set_hexpand(true);
+        let sidebar_nav_reload = Button::from_icon_name("view-refresh-symbolic");
+        sidebar_nav_reload.set_size_request(26, 26);
+        sidebar_nav_reload.set_tooltip_text(Some("Reload (Ctrl+R)"));
+        sidebar_nav_reload.set_focus_on_click(false);
+        sidebar_nav_reload.set_hexpand(true);
+        sidebar_nav_box.append(&sidebar_nav_back);
+        sidebar_nav_box.append(&sidebar_nav_forward);
+        sidebar_nav_box.append(&sidebar_nav_reload);
+        sidebar_header.append(&sidebar_nav_box);
+
         sidebar.append(&sidebar_header);
 
         let sidebar_address = gtk4::Entry::new();
@@ -422,6 +519,9 @@ impl BrowserWindow {
             window,
             address,
             sidebar_address,
+            sidebar_nav_back,
+            sidebar_nav_forward,
+            sidebar_nav_reload,
             progress,
             stack,
             tab_strip,
@@ -443,12 +543,33 @@ impl BrowserWindow {
             tabs: RefCell::new(Vec::new()),
             current: RefCell::new(None),
             self_weak: weak_self.clone(),
+            downloads: RefCell::new(Vec::new()),
+            next_download_id: Cell::new(1),
+            completed_downloads: Cell::new(0),
+            downloads_popover: RefCell::new(None),
+            downloads_popover_rows: RefCell::new(None),
+            active_downloads_page: RefCell::new(None),
+            downloads_page_list: RefCell::new(None),
+            downloads_page_search: RefCell::new(None),
+            download_pill: RefCell::new(None),
+            pending_save_dialogs: RefCell::new(Vec::new()),
+            settings: RefCell::new(config::load_settings()),
+            downloads_btn: download_btn.clone(),
+            find_bar: RefCell::new(None),
+            fullscreen: Cell::new(false),
+            pre_fullscreen: Cell::new((0, 0)),
         });
 
         me.apply_chrome_layout();
         me.apply_theme();
         me.wire_system_theme_listener();
         me.wire_navigation(&back, &forward, &reload, &stop);
+        me.wire_navigation(
+            &me.sidebar_nav_back,
+            &me.sidebar_nav_forward,
+            &me.sidebar_nav_reload,
+            &stop,
+        );
         me.wire_address();
         me.wire_keyboard();
         me.wire_window_controls(&close_dot, &min_dot, &zoom_dot);
@@ -459,8 +580,22 @@ impl BrowserWindow {
         me.wire_close_tab(&close_tab);
         me.wire_settings(&settings_btn);
         me.wire_hover();
+        me.wire_download_ui(&download_btn);
+        // Restore the previous session's tabs (falls back to one new tab).
+        me.restore_session();
+        // `download-started` fires on the NETWORK SESSION in the GTK4 API —
+        // per-webview connects fail with a GObject-CRITICAL and never run.
+        // Needs a live webview, so wire it after session restore.
+        me.wire_session_downloads();
 
         me
+    }
+
+    /// Open a new tab for a `target=_blank` navigation and navigate it.
+    pub fn open_url_in_new_tab(&self, uri: &str) {
+        let tab = self.add_tab(false);
+        tab.navigate_to(uri);
+        self.save_session();
     }
 
     pub fn add_tab(&self, blank: bool) -> Rc<Tab> {
@@ -494,6 +629,19 @@ impl BrowserWindow {
         self.tabs.borrow_mut().push(Rc::clone(&tab));
         self.activate_tab(Rc::clone(&tab));
 
+        // Put the cursor in the address/search input so typing works
+        // immediately in a fresh tab — but only for blank (user-initiated)
+        // tabs; session restore and _blank links keep focus where it was.
+        if blank {
+            let me_focus = self.self_weak.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                if let Some(me) = me_focus.upgrade() {
+                    me.focus_address();
+                }
+            });
+        }
+        self.save_session();
+
         let scroll = self.tab_scroll.clone();
         gtk4::glib::idle_add_local_once(move || {
             let hadj = scroll.hadjustment();
@@ -511,12 +659,12 @@ impl BrowserWindow {
                 self.sidebar_revealer.set_visible(false);
             }
             ChromeLayout::Sidebar => {
-                self.auto_hide.set(false);
                 self.progress.set_visible(false);
                 self.topbar_revealer.set_reveal_child(false);
                 self.topbar_revealer.set_visible(false);
-                self.sidebar_revealer.set_reveal_child(true);
                 self.sidebar_revealer.set_visible(true);
+                self.sidebar_revealer
+                    .set_reveal_child(!self.auto_hide.get());
             }
         }
     }
@@ -525,7 +673,6 @@ impl BrowserWindow {
         self.chrome_layout.set(layout);
         if layout == ChromeLayout::Sidebar {
             self.sidebar_enabled.set(true);
-            self.auto_hide.set(false);
         }
         self.apply_chrome_layout();
         self.resort_tabs();
@@ -616,6 +763,7 @@ impl BrowserWindow {
                 }
                 // Re-order if pin state changed via load (rare).
                 self.resort_tabs();
+                self.save_session();
             }
             TabEvent::TitleChanged(title) => {
                 let short = self.short_title(&title);
@@ -666,6 +814,19 @@ impl BrowserWindow {
             }
             TabEvent::PinnedChanged(_pinned) => {
                 self.resort_tabs();
+            }
+            TabEvent::NewWindowRequested(uri) => {
+                if uri.is_empty() {
+                    return;
+                }
+                self.open_url_in_new_tab(&uri);
+            }
+            TabEvent::FullscreenChanged(active) => {
+                if owner.is_some_and(|o| {
+                    self.current_tab().is_some_and(|c| Rc::ptr_eq(&c, o))
+                }) {
+                    self.set_video_fullscreen(active);
+                }
             }
         }
     }
@@ -1068,6 +1229,16 @@ impl BrowserWindow {
         self.apply_theme();
     }
 
+    fn set_download_dir(&self, dir: &str) {
+        self.settings.borrow_mut().download_dir = dir.to_string();
+        config::save_settings(&self.settings.borrow());
+    }
+
+    fn set_ask_download_location(&self, ask: bool) {
+        self.settings.borrow_mut().ask_download_location = ask;
+        config::save_settings(&self.settings.borrow());
+    }
+
     fn wire_system_theme_listener(&self) {
         if let Some(settings) = gtk4::Settings::default() {
             let me_weak = self.self_weak.clone();
@@ -1118,10 +1289,6 @@ impl BrowserWindow {
     /// Called on every URL change (navigation + tab switch) to decide whether
     /// the topbar should auto-hide. New-tab / blank pages always show it.
     fn update_auto_hide_for_url(&self, url: &str) {
-        if self.chrome_layout.get() == ChromeLayout::Sidebar {
-            self.apply_chrome_layout();
-            return;
-        }
         let is_blank = url.is_empty()
             || url == "about:newtab"
             || url == "about:blank"
@@ -1134,17 +1301,18 @@ impl BrowserWindow {
     }
 
     fn enable_auto_hide(&self) {
-        if self.chrome_layout.get() != ChromeLayout::Topbar {
-            return;
-        }
         self.auto_hide.set(true);
-        self.topbar_revealer.set_reveal_child(false);
+        match self.chrome_layout.get() {
+            ChromeLayout::Topbar => self.topbar_revealer.set_reveal_child(false),
+            ChromeLayout::Sidebar => self.sidebar_revealer.set_reveal_child(false),
+        }
     }
 
     fn disable_auto_hide(&self) {
         self.auto_hide.set(false);
-        if self.chrome_layout.get() == ChromeLayout::Topbar {
-            self.topbar_revealer.set_reveal_child(true);
+        match self.chrome_layout.get() {
+            ChromeLayout::Topbar => self.topbar_revealer.set_reveal_child(true),
+            ChromeLayout::Sidebar => self.sidebar_revealer.set_reveal_child(true),
         }
     }
 
@@ -1153,21 +1321,36 @@ impl BrowserWindow {
     ///     and hides it again once the pointer moves > 54 px below the top.
     ///   • shows the sidebar when the pointer is within 8 px of the left edge,
     ///     and hides it again once the pointer moves > 230 px away from the left edge.
+    ///   • in Sidebar (vertical tabs) layout: shows the sidebar when the
+    ///     pointer is within 8 px of the left edge, hides it again once the
+    ///     pointer moves > 260 px away from the left edge.
     fn wire_hover(&self) {
         let motion = gtk4::EventControllerMotion::new();
         // Capture phase: we see events before WebKit or any child widget.
         motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let me_weak = self.self_weak.clone();
-        motion.connect_motion(move |_, _x, y| {
+        motion.connect_motion(move |_, x, y| {
             let Some(me) = me_weak.upgrade() else { return };
-            if me.chrome_layout.get() != ChromeLayout::Topbar || !me.auto_hide.get() {
+            if !me.auto_hide.get() {
                 return;
             }
-
-            if y < 8.0 {
-                me.topbar_revealer.set_reveal_child(true);
-            } else if y > 54.0 {
-                me.topbar_revealer.set_reveal_child(false);
+            match me.chrome_layout.get() {
+                ChromeLayout::Topbar => {
+                    if y < 8.0 {
+                        me.topbar_revealer.set_reveal_child(true);
+                    } else if y > 54.0 {
+                        me.topbar_revealer.set_reveal_child(false);
+                    }
+                }
+                ChromeLayout::Sidebar => {
+                    // Sidebar is 250 px wide; reveal near the left edge,
+                    // hide again once the pointer moves well into content.
+                    if x < 8.0 {
+                        me.sidebar_revealer.set_reveal_child(true);
+                    } else if x > 260.0 {
+                        me.sidebar_revealer.set_reveal_child(false);
+                    }
+                }
             }
         });
         self.window.add_controller(motion);
@@ -1193,6 +1376,9 @@ impl BrowserWindow {
                 (false, false, true, Key::Left) => Some(WinCmd::Back),
                 (false, false, true, Key::Right) => Some(WinCmd::Forward),
                 (false, false, true, Key::f) => Some(WinCmd::OpenBrowserMenu),
+                (false, false, false, Key::Escape) if me.fullscreen.get() => {
+                    Some(WinCmd::ToggleFullscreen)
+                }
                 (false, false, false, Key::F5) => Some(WinCmd::Reload),
                 (false, false, false, Key::Escape) => {
                     if me.active_settings_modal.borrow().is_some() {
@@ -1203,6 +1389,15 @@ impl BrowserWindow {
                     }
                 }
                 (true, false, false, Key::t) => Some(WinCmd::NewTab),
+                (true, false, false, Key::f) => Some(WinCmd::FindOpen),
+                (false, false, false, Key::F3) => Some(WinCmd::FindNext),
+                (true, false, false, Key::g) => Some(WinCmd::FindNext),
+                (true, true, false, Key::g) => Some(WinCmd::FindPrev),
+                (true, false, false, Key::equal) => Some(WinCmd::ZoomIn),
+                (true, false, false, Key::plus) => Some(WinCmd::ZoomIn),
+                (true, false, false, Key::minus) => Some(WinCmd::ZoomOut),
+                (true, false, false, Key::_0) => Some(WinCmd::ZoomReset),
+                (false, false, false, Key::F11) => Some(WinCmd::ToggleFullscreen),
                 (true, false, false, Key::w) => Some(WinCmd::CloseTab),
                 (true, false, false, Key::Tab) => Some(WinCmd::NextTab),
                 (true, true, false, Key::Tab) | (true, true, false, Key::ISO_Left_Tab) => {
@@ -1232,6 +1427,17 @@ impl BrowserWindow {
         self.window.add_controller(controller);
     }
 
+    /// Focus the layout-appropriate address input and select its contents.
+    fn focus_address(&self) {
+        let entry = if self.chrome_layout.get() == ChromeLayout::Sidebar {
+            &self.sidebar_address
+        } else {
+            &self.address
+        };
+        entry.grab_focus();
+        entry.select_region(0, -1);
+    }
+
     pub fn handle_cmd(&self, cmd: WinCmd) {
         match cmd {
             WinCmd::Back => {
@@ -1254,15 +1460,7 @@ impl BrowserWindow {
                     t.stop();
                 }
             }
-            WinCmd::FocusAddress => {
-                let entry = if self.chrome_layout.get() == ChromeLayout::Sidebar {
-                    &self.sidebar_address
-                } else {
-                    &self.address
-                };
-                entry.grab_focus();
-                entry.select_region(0, -1);
-            }
+            WinCmd::FocusAddress => self.focus_address(),
             WinCmd::NewTab => {
                 self.add_tab(true);
             }
@@ -1281,6 +1479,25 @@ impl BrowserWindow {
             }
             WinCmd::OpenBrowserMenu => self.show_browser_menu(),
             WinCmd::OpenSettings => self.open_settings_dialog(),
+            WinCmd::FindOpen => self.open_find_bar(),
+            WinCmd::FindNext => self.find_next(),
+            WinCmd::FindPrev => self.find_prev(),
+            WinCmd::ZoomIn => {
+                if let Some(t) = self.current_tab() {
+                    t.zoom_in();
+                }
+            }
+            WinCmd::ZoomOut => {
+                if let Some(t) = self.current_tab() {
+                    t.zoom_out();
+                }
+            }
+            WinCmd::ZoomReset => {
+                if let Some(t) = self.current_tab() {
+                    t.zoom_reset();
+                }
+            }
+            WinCmd::ToggleFullscreen => self.toggle_fullscreen_window(),
         }
     }
 
@@ -1311,6 +1528,1414 @@ impl BrowserWindow {
             drop(tabs);
             self.activate_tab(tab);
         }
+    }
+
+    // ── Find in page ─────────────────────────────────────────────────────────
+
+    fn open_find_bar(&self) {
+        let reuse = self.find_bar.borrow().is_some();
+        if !reuse {
+            let container = GtkBox::new(Orientation::Horizontal, 6);
+            container.set_css_classes(&["find-bar"]);
+            container.set_halign(gtk4::Align::End);
+            container.set_valign(gtk4::Align::Start);
+            container.set_margin_top(6);
+            container.set_margin_end(10);
+
+            let entry = gtk4::Entry::new();
+            entry.set_placeholder_text(Some("Find in page"));
+            entry.set_width_request(220);
+            entry.set_css_classes(&["find-entry"]);
+
+            let label = Label::new(None);
+            label.set_css_classes(&["find-label"]);
+
+            let prev_btn = Button::from_icon_name("go-up-symbolic");
+            prev_btn.set_tooltip_text(Some("Previous match (Shift+Enter / Ctrl+Shift+G)"));
+            prev_btn.set_css_classes(&["flat"]);
+            let next_btn = Button::from_icon_name("go-down-symbolic");
+            next_btn.set_tooltip_text(Some("Next match (Enter / Ctrl+G)"));
+            next_btn.set_css_classes(&["flat"]);
+            let close_btn = Button::from_icon_name("window-close-symbolic");
+            close_btn.set_css_classes(&["flat"]);
+
+            container.append(&entry);
+            container.append(&label);
+            container.append(&prev_btn);
+            container.append(&next_btn);
+            container.append(&close_btn);
+
+            self.overlay.add_overlay(&container);
+
+            *self.find_bar.borrow_mut() = Some(FindBar {
+                container: container.clone(),
+                entry: entry.clone(),
+            });
+
+            let me_weak = self.self_weak.clone();
+            entry.connect_activate(move |entry| {
+                let Some(me) = me_weak.upgrade() else { return };
+                let text = entry.text().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                if let Some(t) = me.current_tab() {
+                    t.find(&text, true);
+                }
+            });
+            let me_weak2 = self.self_weak.clone();
+            entry.connect_changed(move |entry| {
+                let Some(me) = me_weak2.upgrade() else { return };
+                let text = entry.text().to_string();
+                if let Some(t) = me.current_tab() {
+                    if text.is_empty() {
+                        t.find_done();
+                    } else {
+                        t.find(&text, true);
+                    }
+                }
+            });
+            let me_weak3 = self.self_weak.clone();
+            next_btn.connect_clicked(move |_| {
+                if let Some(me) = me_weak3.upgrade() {
+                    me.find_next();
+                }
+            });
+            let me_weak4 = self.self_weak.clone();
+            prev_btn.connect_clicked(move |_| {
+                if let Some(me) = me_weak4.upgrade() {
+                    me.find_prev();
+                }
+            });
+            let me_weak5 = self.self_weak.clone();
+            close_btn.connect_clicked(move |_| {
+                if let Some(me) = me_weak5.upgrade() {
+                    me.close_find_bar();
+                }
+            });
+
+            // Esc closes when the entry has focus.
+            let esc = EventControllerKey::new();
+            let me_weak6 = self.self_weak.clone();
+            esc.connect_key_pressed(move |_ctrl, key, _kc, _st| {
+                if key == Key::Escape {
+                    if let Some(me) = me_weak6.upgrade() {
+                        me.close_find_bar();
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                }
+                gtk4::glib::Propagation::Proceed
+            });
+            entry.add_controller(esc);
+        }
+
+        if let Some(fb) = self.find_bar.borrow().as_ref() {
+            fb.container.set_visible(true);
+            fb.entry.grab_focus();
+        }
+    }
+
+    fn close_find_bar(&self) {
+        if let Some(fb) = self.find_bar.borrow().as_ref() {
+            if let Some(t) = self.current_tab() {
+                t.find_done();
+            }
+            fb.container.set_visible(false);
+        }
+        if let Some(win) = self.window.default_widget() {
+            let _ = win;
+        }
+    }
+
+    fn find_next(&self) {
+        if let Some(t) = self.current_tab() {
+            t.find_next("");
+        }
+    }
+
+    fn find_prev(&self) {
+        if let Some(t) = self.current_tab() {
+            t.find_prev("");
+        }
+    }
+
+    // ── Fullscreen (video player + F11) ────────────────────────────────────
+
+    fn set_video_fullscreen(&self, active: bool) {
+        let w = &self.window;
+        if active && !self.fullscreen.get() {
+            let width = w.default_width();
+            let height = w.default_height();
+            self.pre_fullscreen.set((width, height));
+            self.fullscreen.set(true);
+            unsafe {
+                ffi::gtk_window_fullscreen(w.as_ptr() as *mut std::os::raw::c_void);
+            }
+        } else if !active && self.fullscreen.get() {
+            self.fullscreen.set(false);
+            unsafe {
+                ffi::gtk_window_unfullscreen(w.as_ptr() as *mut std::os::raw::c_void);
+            }
+        }
+    }
+
+    fn toggle_fullscreen_window(&self) {
+        self.set_video_fullscreen(!self.fullscreen.get());
+    }
+
+    // ── Session save / restore ─────────────────────────────────────────────
+
+    fn session_path() -> std::path::PathBuf {
+        crate::adblock::data_dir_shared().join("session.json")
+    }
+
+    /// Persist open tab URIs (called on tab open/close/navigation).
+    fn save_session(&self) {
+        let uris: Vec<String> = self
+            .tabs
+            .borrow()
+            .iter()
+            .map(|t| t.session_uri())
+            .filter(|u| {
+                !u.is_empty()
+                    && u != "about:newtab"
+                    && !u.starts_with("data:")
+                    && u != "about:blank"
+            })
+            .collect();
+        let json = serde_json::to_string(&uris).unwrap_or_else(|_| "[]".into());
+        let path = Self::session_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, json.as_bytes());
+    }
+
+    /// Restore the last session's tabs, if any. Falls back to one new tab.
+    fn restore_session(&self) {
+        let uris: Vec<String> = std::fs::read_to_string(Self::session_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        let uris: Vec<String> = uris
+            .into_iter()
+            .filter(|u| !u.is_empty() && !u.starts_with("data:"))
+            .collect();
+        if uris.is_empty() {
+            self.add_tab(true);
+            return;
+        }
+        eprintln!("[session] restoring {} tab(s)", uris.len());
+        for uri in &uris {
+            let tab = self.add_tab(false);
+            tab.navigate_to(uri);
+        }
+    }
+
+    // ── Downloads ──────────────────────────────────────────────────────────
+
+    fn downloads_dir() -> std::path::PathBuf {
+        std::env::var_os("XDG_DOWNLOAD_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            })
+    }
+
+    /// Wire `download-started` once, on the shared network session. The
+    /// handler lives on the session (app-wide), so any live webview works
+    /// as the hook source; the closure only carries a Weak.
+    fn wire_session_downloads(&self) {
+        let Some(tab) = self.current_tab() else {
+            eprintln!("[download] no webview to hook session downloads");
+            return;
+        };
+        let me_weak = self.self_weak.clone();
+        tab.webview.connect_session_downloads(move |download| {
+            if let Some(me) = me_weak.upgrade() {
+                me.on_download_started(download);
+            }
+        });
+    }
+
+    /// Wire the download button: click opens the full downloads page,
+    /// right-click opens the quick popover.
+    fn wire_download_ui(&self, btn: &Button) {
+        btn.set_tooltip_text(Some("Downloads (right-click: quick list)"));
+        let me_weak = self.self_weak.clone();
+        btn.connect_clicked(move |_| {
+            if let Some(me) = me_weak.upgrade() {
+                me.toggle_downloads_page();
+            }
+        });
+        let right = GestureClick::new();
+        right.set_button(gtk4::gdk::BUTTON_SECONDARY);
+        let me_weak2 = self.self_weak.clone();
+        right.connect_pressed(move |_, _, _, _| {
+            if let Some(me) = me_weak2.upgrade() {
+                me.show_downloads_popover();
+            }
+        });
+        btn.add_controller(right);
+    }
+
+    /// Toggle the full-page downloads view (Brave-style native overlay).
+    fn toggle_downloads_page(&self) {
+        if self.active_downloads_page.borrow().is_some() {
+            self.close_downloads_page();
+        } else {
+            self.open_downloads_page();
+        }
+    }
+
+    /// Show the full-page downloads view covering the content area.
+    fn open_downloads_page(&self) {
+        if self.active_downloads_page.borrow().is_some() {
+            self.rebuild_downloads_page();
+            return;
+        }
+        let backdrop = GtkBox::new(Orientation::Vertical, 0);
+        backdrop.set_hexpand(true);
+        backdrop.set_vexpand(true);
+        backdrop.set_halign(gtk4::Align::Fill);
+        backdrop.set_valign(gtk4::Align::Fill);
+        backdrop.set_css_classes(&["downloads-page-backdrop"]);
+
+        // Card fills most of the window.
+        let card = GtkBox::new(Orientation::Vertical, 0);
+        card.set_css_classes(&["downloads-page-card"]);
+        card.set_hexpand(true);
+        card.set_vexpand(true);
+        card.set_margin_top(24);
+        card.set_margin_bottom(24);
+        card.set_margin_start(32);
+        card.set_margin_end(32);
+        backdrop.append(&card);
+
+        // Header: title + close.
+        let header = GtkBox::new(Orientation::Horizontal, 12);
+        header.set_css_classes(&["downloads-page-header"]);
+        let title = Label::new(Some("Downloads"));
+        title.set_css_classes(&["downloads-page-title"]);
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        let close_btn = Button::from_icon_name("window-close-symbolic");
+        close_btn.set_css_classes(&["settings-modal-close-btn"]);
+        close_btn.set_valign(gtk4::Align::Center);
+        close_btn.set_focus_on_click(false);
+        header.append(&title);
+        header.append(&close_btn);
+        card.append(&header);
+
+        // Toolbar: search + Clear all.
+        let toolbar = GtkBox::new(Orientation::Horizontal, 8);
+        toolbar.set_css_classes(&["downloads-page-toolbar"]);
+        let search = gtk4::Entry::new();
+        search.set_placeholder_text(Some("Search download history"));
+        search.set_hexpand(true);
+        search.set_valign(gtk4::Align::Center);
+        search.set_css_classes(&["downloads-page-search"]);
+        let clear_btn = Button::with_label("Clear all");
+        clear_btn.set_css_classes(&["settings-dropdown-btn"]);
+        clear_btn.set_valign(gtk4::Align::Center);
+        clear_btn.set_halign(gtk4::Align::End);
+        toolbar.append(&search);
+        toolbar.append(&clear_btn);
+        card.append(&toolbar);
+
+        // Scrollable rows area.
+        let scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+        let list = GtkBox::new(Orientation::Vertical, 0);
+        list.set_css_classes(&["downloads-page-list"]);
+        scroll.set_child(Some(&list));
+        card.append(&scroll);
+
+        self.overlay.add_overlay(&backdrop);
+
+        // Close wiring.
+        let me_close = self.self_weak.clone();
+        close_btn.connect_clicked(move |_| {
+            if let Some(me) = me_close.upgrade() {
+                me.close_downloads_page();
+            }
+        });
+        let me_gesture = self.self_weak.clone();
+        let card_c = card.clone();
+        let backdrop_c = backdrop.clone();
+        let g = GestureClick::new();
+        g.connect_pressed(move |_, _, x, y| {
+            if let Some(me) = me_gesture.upgrade() {
+                if let Some(rect) = card_c.compute_bounds(&backdrop_c) {
+                    let pt = gtk4::graphene::Point::new(x as f32, y as f32);
+                    if !rect.contains_point(&pt) {
+                        me.close_downloads_page();
+                    }
+                }
+            }
+        });
+        backdrop.add_controller(g);
+        let me_esc = self.self_weak.clone();
+        let key = gtk4::EventControllerKey::new();
+        key.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk4::gdk::Key::Escape {
+                if let Some(me) = me_esc.upgrade() {
+                    me.close_downloads_page();
+                }
+                return gtk4::glib::Propagation::Stop;
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+        backdrop.add_controller(key);
+
+        // Search + Clear wiring.
+        let me_search = self.self_weak.clone();
+        search.connect_changed(move |_| {
+            if let Some(me) = me_search.upgrade() {
+                me.rebuild_downloads_page();
+            }
+        });
+        let me_clear = self.self_weak.clone();
+        clear_btn.connect_clicked(move |_| {
+            if let Some(me) = me_clear.upgrade() {
+                config::clear_download_entries();
+                me.rebuild_downloads_page();
+            }
+        });
+
+        *self.active_downloads_page.borrow_mut() = Some(backdrop);
+        // Stash the list + search widgets so ticks/search can rebuild rows.
+        *self.downloads_page_list.borrow_mut() = Some(list);
+        *self.downloads_page_search.borrow_mut() = Some(search);
+        self.rebuild_downloads_page();
+    }
+
+    fn close_downloads_page(&self) {
+        if let Some(page) = self.active_downloads_page.borrow_mut().take() {
+            self.overlay.remove_overlay(&page);
+            *self.downloads_page_list.borrow_mut() = None;
+            *self.downloads_page_search.borrow_mut() = None;
+        }
+    }
+
+    /// Rebuild the rows in the open downloads page (live + history).
+    fn rebuild_downloads_page(&self) {
+        let Some(list) = self.downloads_page_list.borrow().as_ref().map(|l| l.clone()) else {
+            return;
+        };
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+        let filter = self
+            .downloads_page_search
+            .borrow()
+            .as_ref()
+            .map(|e| e.text().to_string().to_lowercase())
+            .unwrap_or_default();
+        let matches = |name: &str, dest: &str| {
+            filter.is_empty()
+                || name.to_lowercase().contains(&filter)
+                || dest.to_lowercase().contains(&filter)
+        };
+
+        let mut rows = 0;
+
+        // Active downloads on top.
+        let live: Vec<(String, String, f64, u64)> = self.downloads.borrow().iter().map(|d| {
+            let pct = unsafe { ffi::webkit_download_get_estimated_progress(d.download) } * 100.0;
+            (d.name.clone(), d.dest.clone(), pct, d.id)
+        }).collect();
+        if !live.is_empty() {
+            list.append(&Self::downloads_section_label("Active"));
+            for (name, _dest, pct, id) in live {
+                let bar = gtk4::LevelBar::builder()
+                    .min_value(0.0)
+                    .max_value(100.0)
+                    .value(pct)
+                    .valign(gtk4::Align::Center)
+                    .build();
+                bar.set_width_request(140);
+                let (row, _) = Self::download_row(
+                    &name,
+                    &format!("{pct:.0}% — downloading"),
+                    Some(&bar),
+                    id,
+                    self.self_weak.clone(),
+                );
+                list.append(&row);
+                rows += 1;
+            }
+        }
+
+        // Persisted history grouped by day.
+        let entries = config::load_download_entries();
+        let mut last_label = String::new();
+        for e in entries.iter().rev() {
+            if !matches(&e.name, &e.dest) {
+                continue;
+            }
+            let label = Self::day_label(e.when);
+            if label != last_label {
+                list.append(&Self::downloads_section_label(&label));
+                last_label = label;
+            }
+            list.append(&Self::history_row(e, self.self_weak.clone()));
+            rows += 1;
+        }
+
+        if rows == 0 {
+            let empty = Label::new(Some("No downloads yet"));
+            empty.set_css_classes(&["downloads-empty"]);
+            empty.set_vexpand(true);
+            list.append(&empty);
+        }
+    }
+
+    fn downloads_section_label(text: &str) -> Label {
+        let l = Label::new(Some(text));
+        l.set_css_classes(&["downloads-section-label"]);
+        l.set_xalign(0.0);
+        l.set_margin_top(14);
+        l.set_margin_bottom(4);
+        l.set_margin_start(4);
+        l
+    }
+
+    /// History row with Open / Show-in-folder / Remove actions.
+    fn history_row(e: &config::DownloadEntry, me_weak: Weak<BrowserWindow>) -> GtkBox {
+        let row = GtkBox::new(Orientation::Horizontal, 10);
+        row.set_css_classes(&["downloads-page-row"]);
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+
+        let icon = gtk4::Image::from_icon_name("application-x-executable-symbolic");
+        icon.set_css_classes(&["downloads-file-icon"]);
+        icon.set_valign(gtk4::Align::Center);
+        row.append(&icon);
+
+        let info = GtkBox::new(Orientation::Vertical, 1);
+        info.set_hexpand(true);
+        info.set_valign(gtk4::Align::Center);
+        let title = Label::new(Some(&e.name));
+        title.set_css_classes(&["downloads-row-title"]);
+        title.set_xalign(0.0);
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        let sub = Label::new(Some(&e.dest));
+        sub.set_css_classes(&["downloads-row-sub"]);
+        sub.set_xalign(0.0);
+        sub.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        info.append(&title);
+        info.append(&sub);
+        row.append(&info);
+
+        let open_btn = Button::from_icon_name("document-open-symbolic");
+        open_btn.set_tooltip_text(Some("Open file"));
+        open_btn.set_css_classes(&["downloads-cancel-btn"]);
+        open_btn.set_valign(gtk4::Align::Center);
+        let dest = e.dest.clone();
+        open_btn.connect_clicked(move |_| {
+            let _ = std::process::Command::new("xdg-open").arg(&dest).spawn();
+        });
+        row.append(&open_btn);
+
+        let folder_btn = Button::from_icon_name("folder-open-symbolic");
+        folder_btn.set_tooltip_text(Some("Show in folder"));
+        folder_btn.set_css_classes(&["downloads-cancel-btn"]);
+        folder_btn.set_valign(gtk4::Align::Center);
+        let dir = std::path::PathBuf::from(&e.dest);
+        folder_btn.connect_clicked(move |_| {
+            if let Some(parent) = dir.parent() {
+                let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+            }
+        });
+        row.append(&folder_btn);
+
+        let rm_btn = Button::from_icon_name("window-close-symbolic");
+        rm_btn.set_tooltip_text(Some("Remove from list"));
+        rm_btn.set_css_classes(&["downloads-cancel-btn"]);
+        rm_btn.set_valign(gtk4::Align::Center);
+        let dest = e.dest.clone();
+        let when = e.when;
+        rm_btn.connect_clicked(move |_| {
+            config::remove_download_entry(&dest, when);
+            if let Some(me) = me_weak.upgrade() {
+                me.rebuild_downloads_page();
+            }
+        });
+        row.append(&rm_btn);
+
+        row
+    }
+
+    /// "Today" / "Yesterday" / "September 27, 2026" from unix seconds.
+    fn day_label(when: u64) -> String {
+        let secs = i64::try_from(when).unwrap_or(0);
+        let days = secs.div_euclid(86400);
+        let now_days = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 / 86400)
+            .unwrap_or(days);
+        let (y, m, d) = Self::civil_from_days(days);
+        let month = [
+            "January", "February", "March", "April", "May", "June", "July",
+            "August", "September", "October", "November", "December",
+        ][(m - 1).clamp(0, 11) as usize];
+        if days == now_days {
+            "Today".to_string()
+        } else if days == now_days - 1 {
+            "Yesterday".to_string()
+        } else {
+            format!("{month} {d}, {y}")
+        }
+    }
+
+    /// Days-since-epoch → (year, month, day). Howard Hinnant's civil calendar.
+    fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
+    /// The folder downloads go to: user setting, else XDG/~/Downloads.
+    fn effective_download_dir(&self) -> std::path::PathBuf {
+        let configured = self.settings.borrow().download_dir.clone();
+        if !configured.is_empty() {
+            std::path::PathBuf::from(configured)
+        } else {
+            Self::downloads_dir()
+        }
+    }
+
+    /// One row inside the downloads popover: (row, optional cancel button).
+    fn download_row(
+        name: &str,
+        detail: &str,
+        progress: Option<&gtk4::LevelBar>,
+        cancel_id: u64,
+        me_weak: Weak<BrowserWindow>,
+    ) -> (GtkBox, Option<Button>) {
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+        row.set_margin_start(10);
+        row.set_margin_end(10);
+
+        let icon = gtk4::Image::from_icon_name(if progress.is_some() {
+            "document-save-symbolic"
+        } else {
+            "document-open-recent-symbolic"
+        });
+        icon.set_valign(gtk4::Align::Center);
+        row.append(&icon);
+
+        let info = GtkBox::new(Orientation::Vertical, 1);
+        info.set_hexpand(true);
+        info.set_valign(gtk4::Align::Center);
+        let title = Label::new(Some(name));
+        title.set_css_classes(&["downloads-row-title"]);
+        title.set_xalign(0.0);
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+        info.append(&title);
+        let sub = Label::new(Some(detail));
+        sub.set_css_classes(&["downloads-row-sub"]);
+        sub.set_xalign(0.0);
+        sub.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+        info.append(&sub);
+        if let Some(bar) = progress {
+            info.append(bar);
+        }
+        row.append(&info);
+
+        let mut cancel = None;
+        if cancel_id != 0 {
+            let btn = Button::from_icon_name("process-stop-symbolic");
+            btn.set_tooltip_text(Some("Cancel download"));
+            btn.set_css_classes(&["downloads-cancel-btn"]);
+            btn.set_valign(gtk4::Align::Center);
+            btn.connect_clicked(move |_| {
+                if let Some(me) = me_weak.upgrade() {
+                    me.cancel_download(cancel_id);
+                }
+            });
+            cancel = Some(btn.clone());
+            row.append(&btn);
+        }
+        (row, cancel)
+    }
+
+    /// Tag a popover with the active theme.
+    ///
+    /// A popover is a separate toplevel surface, so it never inherits the
+    /// `dark` class we set on the main window — left untagged it renders with
+    /// the light GTK defaults, which is why menus came up as pale boxes with
+    /// washed-out text on a dark page.
+    fn theme_popover(&self, pop: &gtk4::Popover) {
+        if self.is_dark_active() {
+            pop.add_css_class("dark");
+        } else {
+            pop.add_css_class("light");
+        }
+    }
+
+    /// Popover listing live downloads + today's history, with an
+    /// "Open download page" link. Refreshed live while downloads run.
+    fn show_downloads_popover(&self) {
+        // Toggle: an open popover closes instead of rebuilding.
+        if let Some(pop) = self.downloads_popover.borrow().as_ref() {
+            pop.popdown();
+            return;
+        }
+        let pop = gtk4::Popover::new();
+        self.theme_popover(&pop);
+        pop.set_has_arrow(false);
+        pop.set_parent(&self.downloads_btn);
+        *self.downloads_popover.borrow_mut() = Some(pop.clone());
+        {
+            let me2 = self.self_weak.clone();
+            let pop2 = pop.clone();
+            pop.connect_closed(move |_| {
+                if pop2.parent().is_some() {
+                    pop2.unparent();
+                }
+                if let Some(me) = me2.upgrade() {
+                    *me.downloads_popover.borrow_mut() = None;
+                    *me.downloads_popover_rows.borrow_mut() = None;
+                }
+            });
+        }
+        let box_ = GtkBox::new(Orientation::Vertical, 0);
+        box_.set_css_classes(&["downloads-popover"]);
+        box_.set_width_request(340);
+
+        let header = GtkBox::new(Orientation::Horizontal, 8);
+        let title = Label::new(Some("Downloads"));
+        title.set_css_classes(&["downloads-header"]);
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        header.append(&title);
+        let page_btn = Button::from_icon_name("view-fullscreen-symbolic");
+        page_btn.set_tooltip_text(Some("Open full download page"));
+        page_btn.set_css_classes(&["downloads-cancel-btn"]);
+        let me_page = self.self_weak.clone();
+        page_btn.connect_clicked(move |_| {
+            if let Some(me) = me_page.upgrade() {
+                me.close_downloads_popover();
+                me.toggle_downloads_page();
+            }
+        });
+        header.append(&page_btn);
+        box_.append(&header);
+
+        let rows_box = GtkBox::new(Orientation::Vertical, 0);
+        box_.append(&rows_box);
+        // Stash so progress ticks can rebuild the rows live.
+        *self.downloads_popover_rows.borrow_mut() = Some(rows_box.clone());
+        self.fill_downloads_rows(&rows_box);
+
+        let open_dir = Button::with_label("Open Downloads Folder");
+        open_dir.set_css_classes(&["downloads-open-dir"]);
+        open_dir.set_halign(gtk4::Align::Fill);
+        let me_weak = self.self_weak.clone();
+        let pop2 = pop.clone();
+        open_dir.connect_clicked(move |_| {
+            if let Some(me) = me_weak.upgrade() {
+                let dir = me.effective_download_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+            }
+            pop2.popdown();
+        });
+        box_.append(&open_dir);
+
+        pop.set_child(Some(&box_));
+        pop.present();
+    }
+
+    fn close_downloads_popover(&self) {
+        if let Some(pop) = self.downloads_popover.borrow().as_ref() {
+            pop.popdown();
+        }
+        *self.downloads_popover.borrow_mut() = None;
+        *self.downloads_popover_rows.borrow_mut() = None;
+    }
+
+    /// Fill/re-fill a downloads rows container (popover body or page list).
+    fn fill_downloads_rows(&self, rows_box: &GtkBox) {
+        while let Some(child) = rows_box.first_child() {
+            rows_box.remove(&child);
+        }
+        let mut rows = 0;
+        let live: Vec<(String, f64, u64)> = self.downloads.borrow().iter().map(|d| {
+            let pct = unsafe { ffi::webkit_download_get_estimated_progress(d.download) } * 100.0;
+            (d.name.clone(), pct, d.id)
+        }).collect();
+        for (name, pct, id) in live {
+            let bar = gtk4::LevelBar::builder()
+                .min_value(0.0)
+                .max_value(100.0)
+                .value(pct)
+                .valign(gtk4::Align::Center)
+                .build();
+            let (row, _) = Self::download_row(
+                &name,
+                &format!("{pct:.0}% — downloading"),
+                Some(&bar),
+                id,
+                self.self_weak.clone(),
+            );
+            rows_box.append(&row);
+            rows += 1;
+        }
+        let history: Vec<config::DownloadEntry> =
+            config::load_download_entries().into_iter().rev().take(5).collect();
+        for h in history {
+            let (row, _) = Self::download_row(&h.name, &h.dest, None, 0, Weak::new());
+            rows_box.append(&row);
+            rows += 1;
+        }
+        if rows == 0 {
+            let empty = Label::new(Some("No downloads yet"));
+            empty.set_css_classes(&["downloads-empty"]);
+            empty.set_margin_top(8);
+            empty.set_margin_bottom(8);
+            rows_box.append(&empty);
+        }
+    }
+
+    /// Rebuild popover rows + page list + persistent pill after any
+    /// download state change.
+    fn refresh_download_ui(&self) {
+        if let Some(rows) = self.downloads_popover_rows.borrow().as_ref().map(|r| r.clone()) {
+            self.fill_downloads_rows(&rows);
+        }
+        if self.active_downloads_page.borrow().is_some() {
+            self.rebuild_downloads_page();
+        }
+        self.update_download_pill();
+    }
+
+    /// Persistent bottom-right card while any download is active: filename,
+    /// transferred/total size, a progress bar and a cancel button. Updated in
+    /// place on every poll tick so it never flickers.
+    fn update_download_pill(&self) {
+        let live = self.downloads.borrow();
+        if live.is_empty() {
+            drop(live);
+            if let Some(p) = self.download_pill.borrow_mut().take() {
+                self.overlay.remove_overlay(&p.root);
+            }
+            return;
+        }
+        let d = &live[0];
+        let id = d.id;
+        let name = d.name.clone();
+        let extra = live.len() - 1;
+        let fraction = unsafe { ffi::webkit_download_get_estimated_progress(d.download) };
+        let received = unsafe { ffi::webkit_download_get_received_data_length(d.download) };
+        let total = unsafe {
+            let resp = ffi::webkit_download_get_response(d.download);
+            if resp.is_null() {
+                0
+            } else {
+                ffi::webkit_uri_response_get_content_length(resp)
+            }
+        };
+        drop(live);
+
+        // Keep the widget and only update the text/bar: rebuilding it each
+        // tick made the card jump and leak overlays.
+        let existing = self
+            .download_pill
+            .borrow_mut()
+            .as_ref()
+            .map(|p| (p.root.clone(), p.title.clone(), p.meta.clone(), p.bar.clone()));
+        if let Some((_root, title, meta, bar)) = existing {
+            title.set_text(&name);
+            meta.set_text(&Self::download_progress_text(fraction, received, total, extra));
+            bar.set_fraction(fraction.clamp(0.0, 1.0));
+            return;
+        }
+
+        let root = GtkBox::new(Orientation::Vertical, 8);
+        root.set_css_classes(&["download-pill"]);
+        root.set_halign(gtk4::Align::End);
+        root.set_valign(gtk4::Align::End);
+        root.set_margin_end(18);
+        root.set_margin_bottom(18);
+
+        // Row 1: icon + name + cancel.
+        let top = GtkBox::new(Orientation::Horizontal, 10);
+        top.set_css_classes(&["download-pill-top"]);
+        let icon = gtk4::Image::from_icon_name("folder-download-symbolic");
+        icon.set_css_classes(&["download-pill-icon"]);
+        icon.set_valign(gtk4::Align::Start);
+        icon.set_pixel_size(18);
+
+        let name_box = GtkBox::new(Orientation::Vertical, 2);
+        name_box.set_hexpand(true);
+        let title = Label::new(Some(&name));
+        title.set_css_classes(&["download-pill-title"]);
+        title.set_xalign(0.0);
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        let meta = Label::new(Some(&Self::download_progress_text(
+            fraction, received, total, extra,
+        )));
+        meta.set_css_classes(&["download-pill-meta"]);
+        meta.set_xalign(0.0);
+        meta.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        name_box.append(&title);
+        name_box.append(&meta);
+
+        let cancel = Button::from_icon_name("window-close-symbolic");
+        cancel.set_tooltip_text(Some("Cancel download"));
+        cancel.set_css_classes(&["download-pill-cancel"]);
+        cancel.set_valign(gtk4::Align::Center);
+        cancel.set_focus_on_click(false);
+        let me_weak = self.self_weak.clone();
+        cancel.connect_clicked(move |_| {
+            if let Some(me) = me_weak.upgrade() {
+                me.cancel_download(id);
+            }
+        });
+
+        top.append(&icon);
+        top.append(&name_box);
+        top.append(&cancel);
+
+        // Row 2: determinate progress bar.
+        let bar = ProgressBar::new();
+        bar.set_css_classes(&["download-pill-bar"]);
+        bar.set_valign(gtk4::Align::Center);
+        bar.set_hexpand(true);
+        bar.set_fraction(fraction.clamp(0.0, 1.0));
+
+        root.append(&top);
+        root.append(&bar);
+        self.overlay.add_overlay(&root);
+        *self.download_pill.borrow_mut() = Some(DownloadPill {
+            root,
+            title,
+            meta,
+            bar,
+        });
+    }
+
+    /// "1.2 MB of 8.4 MB · 42%" (+ N more) with graceful degradation when
+    /// WebKit can't tell us the total size or the byte count yet.
+    fn download_progress_text(fraction: f64, received: u64, total: u64, extra: usize) -> String {
+        let pct = (fraction * 100.0).clamp(0.0, 100.0);
+        let mut text = match (received, total) {
+            (r, t) if t > 0 => format!(
+                "{} of {} · {pct:.0}%",
+                Self::human_bytes(r),
+                Self::human_bytes(t)
+            ),
+            (r, 0) if r > 0 => format!("{} · {pct:.0}%", Self::human_bytes(r)),
+            _ => format!("{pct:.0}%"),
+        };
+        if extra > 0 {
+            text.push_str(&format!(" · +{extra} more"));
+        }
+        text
+    }
+
+    fn human_bytes(bytes: u64) -> String {
+        const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+        let mut v = bytes as f64;
+        let mut unit = 0;
+        while v >= 1024.0 && unit < UNITS.len() - 1 {
+            v /= 1024.0;
+            unit += 1;
+        }
+        if unit == 0 {
+            format!("{bytes} B")
+        } else {
+            format!("{v:.1} {}", UNITS[unit])
+        }
+    }
+
+    /// Cancel a live download and drop it from tracking.
+    fn cancel_download(&self, id: u64) {
+        // Close the "where to save" dialog first: `dlg.close()` emits
+        // `response`, whose handler calls back into cancel_download, and the
+        // download must still be findable at that point.
+        self.close_save_dialog(id);
+        let dl = self
+            .downloads
+            .borrow_mut()
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.download);
+        if let Some(dl) = dl {
+            unsafe { ffi::webkit_download_cancel(dl) };
+        }
+        // Take before retaining: dropping ActiveDownload releases our strong
+        // ref, cancelling just stops the transfer.
+        let pos = self.downloads.borrow_mut().iter().position(|d| d.id == id);
+        let owned = pos.map(|pos| self.downloads.borrow_mut().remove(pos));
+        if let Some(d) = owned {
+            unsafe { ffi::g_object_unref(d.download as *mut ffi::GObject) };
+        }
+        self.refresh_download_ui();
+        self.flash_download_pill("Download cancelled");
+    }
+
+    /// Brief toast in the bottom-right corner ("saved", "cancelled", ...),
+    /// stacked above the live-download card so the two never overlap.
+    fn flash_download_pill(&self, text: &str) {
+        let toast = GtkBox::new(Orientation::Horizontal, 8);
+        toast.set_css_classes(&["download-toast"]);
+        let lbl = Label::new(Some(text));
+        lbl.set_css_classes(&["download-toast-text"]);
+        lbl.set_xalign(0.0);
+        lbl.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        toast.append(&lbl);
+        toast.set_halign(gtk4::Align::End);
+        toast.set_valign(gtk4::Align::End);
+        toast.set_margin_end(18);
+        // Sits above the download card when one is showing.
+        toast.set_margin_bottom(18);
+        self.overlay.add_overlay(&toast);
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(2800), move || {
+            toast.unparent();
+        });
+    }
+
+    /// Called when the network session reports a new download. Registers it
+    /// and hooks `decide-destination` — the GTK4 signal that asks the app
+    /// where to save. Without a handler WebKit silently uses its default
+    /// (~Downloads) and our UI never learns about the download.
+    fn on_download_started(&self, download: *mut ffi::WebKitDownload) {
+        if download.is_null() {
+            return;
+        }
+        unsafe {
+            let response = ffi::webkit_download_get_response(download);
+            let uri = if response.is_null() {
+                String::new()
+            } else {
+                let p = ffi::webkit_uri_response_get_uri(response);
+                if p.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
+            };
+            let name = if response.is_null() {
+                Self::download_filename_from_uri(&uri)
+            } else {
+                let suggested = ffi::webkit_uri_response_get_suggested_filename(response);
+                if suggested.is_null() {
+                    Self::download_filename_from_uri(&uri)
+                } else {
+                    let s =
+                        std::ffi::CStr::from_ptr(suggested).to_string_lossy().into_owned();
+                    if s.is_empty() {
+                        Self::download_filename_from_uri(&uri)
+                    } else {
+                        s
+                    }
+                }
+            };
+
+            let id = self.next_download_id.get();
+            self.next_download_id.set(id + 1);
+            // `download-started` loans the object — take a strong ref so the
+            // pointer survives while we poll it. Released at every removal site.
+            ffi::g_object_ref(download as *mut ffi::GObject);
+            self.downloads.borrow_mut().push(ActiveDownload {
+                id,
+                name: name.clone(),
+                dest: String::new(), // decided via decide-destination
+                download,
+            });
+            self.connect_download_lifecycle(download, id);
+            self.connect_decide_destination(download, id, name);
+            self.poll_download(id);
+        }
+    }
+
+    /// Hook `decide-destination`: WebKit pauses the download and waits for
+    /// set_destination or cancel once the handler returns TRUE. Ask-mode
+    /// opens the async picker here; default mode assigns immediately.
+    fn connect_decide_destination(
+        &self,
+        download: *mut ffi::WebKitDownload,
+        id: u64,
+        _suggested: String,
+    ) {
+        // NOTE: `data` must be a thin pointer. `Box<dyn Fn(..)>` is a *fat*
+        // pointer; casting it straight to `*mut c_void` silently drops the
+        // vtable, and the trampoline then re-reads garbage as the vtable and
+        // jumps to a wild address. So the closure is boxed twice: the data
+        // pointer addresses a `DecideCb` slot (a sized type, so thin), and
+        // dereferencing it yields the real fat Box intact.
+        type DecideCb = Box<dyn Fn(*const std::os::raw::c_char) + 'static>;
+        unsafe extern "C" fn trampoline(
+            _dl: *mut c_void,
+            suggested: *const std::os::raw::c_char,
+            data: *mut c_void,
+        ) -> i32 {
+            let slot = &*(data as *const DecideCb);
+            slot(suggested);
+            1 // TRUE — handled; WebKit waits for set_destination / cancel
+        }
+        let me_weak = self.self_weak.clone();
+        let cb: DecideCb = Box::new(move |suggested_ptr| {
+            let Some(me) = me_weak.upgrade() else { return };
+            let name = if suggested_ptr.is_null() {
+                String::new()
+            } else {
+                // SAFETY: WebKit guarantees a valid NUL-terminated string
+                // for the lifetime of the decide-destination emission.
+                unsafe { std::ffi::CStr::from_ptr(suggested_ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let name = if name.is_empty() {
+                me.downloads
+                    .borrow()
+                    .iter()
+                    .find(|d| d.id == id)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| "download".into())
+            } else {
+                name
+            };
+            if me.settings.borrow().ask_download_location {
+                // Ask every time — async picker; WebKit stays paused until
+                // set_destination or cancel. Only the id crosses into the
+                // dialog closure: the raw WebKitDownload pointer can dangle
+                // if the download dies while the dialog is open.
+                me.ask_download_destination(id, name);
+            } else {
+                let dir = me.effective_download_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                me.assign_download_destination(id, Self::unique_dest(dir.join(&name)));
+            }
+        });
+        unsafe {
+            let slot = Box::new(cb);
+            ffi::g_signal_connect_data(
+                download as *mut ffi::GObject,
+                c"decide-destination".as_ptr(),
+                Some(std::mem::transmute(
+                    trampoline as unsafe extern "C" fn(
+                        *mut c_void,
+                        *const std::os::raw::c_char,
+                        *mut c_void,
+                    ) -> i32,
+                )),
+                Box::into_raw(slot) as *mut c_void,
+                Some(crate::webview::destroy_notify::<DecideCb>),
+                0,
+            );
+        }
+    }
+
+    /// Uniquify a destination path with " (1)", " (2)"… suffixes.
+    fn unique_dest(dest: std::path::PathBuf) -> std::path::PathBuf {
+        if !dest.exists() {
+            return dest;
+        }
+        let dir = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let stem = dest
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        let ext = dest
+            .extension()
+            .map(|s| format!(".{}", s.to_string_lossy()))
+            .unwrap_or_default();
+        let mut n = 1;
+        loop {
+            let candidate = dir.join(format!("{stem} ({n}){ext}"));
+            if !candidate.exists() {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// The live `WebKitDownload` for `id`, or None if it already finished.
+    /// Every async path (the save dialog, the poll tick) resolves the pointer
+    /// through this rather than capturing it: the `g_object_ref` we take at
+    /// `download-started` is dropped on the fail/cancel paths, so a pointer
+    /// captured earlier can dangle and crash WebKit.
+    fn download_ptr(&self, id: u64) -> Option<*mut ffi::WebKitDownload> {
+        self.downloads
+            .borrow()
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.download)
+    }
+
+    /// Finalize the destination for a download and register it.
+    fn assign_download_destination(&self, id: u64, dest: std::path::PathBuf) {
+        let Some(download) = self.download_ptr(id) else {
+            // Download went away while we were deciding (user cancelled, or
+            // the transfer failed) — nothing to point at a file any more.
+            return;
+        };
+        let c_dest = std::ffi::CString::new(dest.to_string_lossy().as_ref())
+            .unwrap_or_default();
+        unsafe {
+            ffi::webkit_download_set_destination(download, c_dest.as_ptr());
+        }
+        let file_name = dest
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        if let Some(d) = self.downloads.borrow_mut().iter_mut().find(|d| d.id == id) {
+            d.dest = dest.to_string_lossy().into_owned();
+            d.name = file_name.clone();
+        }
+        self.flash_download_pill(&format!("⬇ {file_name}"));
+        self.refresh_download_ui();
+    }
+
+    /// "Save file" dialog. Accept → assign destination; dismiss → cancel the
+    /// download entirely.
+    ///
+    /// Deliberately an in-process `FileChooserDialog`, not `FileDialog` or
+    /// `FileChooserNative`: both of those are only xdg-desktop-portal wrappers,
+    /// and on a session with no portal running they never show a window —
+    /// `FileChooserNative` reports Accept immediately (silently saving into the
+    /// cwd) and `FileDialog` returns "Dismissed by user" straight away. This
+    /// is a plain GTK widget, so it always opens and always waits for a real
+    /// answer.
+    #[allow(deprecated)]
+    fn ask_download_destination(&self, id: u64, suggested: String) {
+        use gtk4::prelude::FileChooserExt;
+
+        let dialog = gtk4::FileChooserDialog::builder()
+            .title("Save Download")
+            .action(gtk4::FileChooserAction::Save)
+            .transient_for(&self.window)
+            .modal(true)
+            .build();
+        dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
+        dialog.add_button("Save", gtk4::ResponseType::Accept);
+        dialog.set_default_response(gtk4::ResponseType::Accept);
+        // Open on the configured download folder so the common case is one
+        // keypress (Enter) rather than a full folder hunt.
+        let start_dir = self.effective_download_dir();
+        if start_dir.is_dir() {
+            let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(start_dir)));
+        }
+        dialog.set_current_name(&suggested);
+        dialog.set_css_classes(&self.dialog_css_classes());
+
+        let me_weak = self.self_weak.clone();
+        // `handled` makes the response handler idempotent: close_save_dialog()
+        // can re-enter through response, and a second pass would cancel the
+        // download we just handed a destination to.
+        let handled = Cell::new(false);
+        dialog.connect_response(move |d, resp| {
+            if handled.replace(true) {
+                return;
+            }
+            let Some(me) = me_weak.upgrade() else {
+                d.close();
+                return;
+            };
+            me.pending_save_dialogs
+                .borrow_mut()
+                .retain(|(did, _)| *did != id);
+            // Must close explicitly: dropping our last reference does not
+            // destroy a *mapped* toplevel, so the dialog would otherwise stay
+            // on screen for the rest of the session and re-ask for every
+            // subsequent download.
+            d.close();
+            if resp == gtk4::ResponseType::Accept {
+                if let Some(path) = d.file().and_then(|f| f.path()) {
+                    // Resolves the WebKitDownload by id — safe even if the
+                    // transfer died while the dialog was open.
+                    me.assign_download_destination(id, path);
+                    return;
+                }
+            }
+            // Dismissed → the user doesn't want this file.
+            me.cancel_download(id);
+        });
+        // Keep the dialog alive while it's up (a dropped visible dialog is a
+        // use-after-free) and so we can close it if the download dies.
+        self.pending_save_dialogs
+            .borrow_mut()
+            .push((id, dialog.clone()));
+        dialog.show();
+    }
+
+    /// Close and forget any save dialog still open for `id`. Called from the
+    /// fail/cancel paths so a dialog can't outlive its download.
+    fn close_save_dialog(&self, id: u64) {
+        let mut pending = self.pending_save_dialogs.borrow_mut();
+        pending.retain(|(did, dlg)| {
+            if *did == id {
+                dlg.close();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Theme classes for standalone toplevels (dialogs). They are not
+    /// descendants of the main window, so they need the class set by hand —
+    /// same reason as `theme_popover`.
+    fn dialog_css_classes(&self) -> Vec<&'static str> {
+        if self.is_dark_active() {
+            vec!["dark"]
+        } else {
+            vec!["light"]
+        }
+    }
+
+    /// Connect `finished` / `failed` so completion is event-driven (works
+    /// even when progress estimation stalls at <100%).
+    fn connect_download_lifecycle(&self, download: *mut ffi::WebKitDownload, id: u64) {
+        // Same double-box rule as `decide-destination`: the pointer handed to
+        // C must be thin, so it addresses a slot holding the fat closure box.
+        type LifecycleCb = Box<dyn Fn() + 'static>;
+        unsafe extern "C" fn finished_trampoline(_dl: *mut c_void, data: *mut c_void) {
+            let slot = &*(data as *const LifecycleCb);
+            slot();
+        }
+        unsafe extern "C" fn failed_trampoline(
+            _dl: *mut c_void,
+            _err: *mut c_void,
+            data: *mut c_void,
+        ) {
+            let slot = &*(data as *const LifecycleCb);
+            slot();
+        }
+        unsafe {
+            // finished → success
+            let me = self.self_weak.clone();
+            let cb: LifecycleCb = Box::new(move || {
+                if let Some(me) = me.upgrade() {
+                    me.finish_download(id);
+                }
+            });
+            let slot = Box::new(cb);
+            ffi::g_signal_connect_data(
+                download as *mut ffi::GObject,
+                c"finished".as_ptr(),
+                Some(std::mem::transmute(
+                    finished_trampoline
+                        as unsafe extern "C" fn(*mut c_void, *mut c_void),
+                )),
+                Box::into_raw(slot) as *mut c_void,
+                Some(crate::webview::destroy_notify::<LifecycleCb>),
+                0,
+            );
+            // failed → error path (incl. user cancellation)
+            let me = self.self_weak.clone();
+            let cb: LifecycleCb = Box::new(move || {
+                if let Some(me) = me.upgrade() {
+                    me.fail_download(id);
+                }
+            });
+            let slot = Box::new(cb);
+            ffi::g_signal_connect_data(
+                download as *mut ffi::GObject,
+                c"failed".as_ptr(),
+                Some(std::mem::transmute(
+                    failed_trampoline
+                        as unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
+                )),
+                Box::into_raw(slot) as *mut c_void,
+                Some(crate::webview::destroy_notify::<LifecycleCb>),
+                0,
+            );
+        }
+    }
+
+    /// Download completed → persist to history, notify.
+    fn finish_download(&self, id: u64) {
+        let pos = self.downloads.borrow_mut().iter().position(|d| d.id == id);
+        let removed = pos.map(|pos| {
+            let d = self.downloads.borrow_mut().remove(pos);
+            unsafe { ffi::g_object_unref(d.download as *mut ffi::GObject) };
+            (d.name.clone(), d.dest.clone())
+        });
+        if let Some((name, dest)) = removed {
+            if !dest.is_empty() {
+                let when = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                config::record_download_entry(config::DownloadEntry {
+                    name: name.clone(),
+                    dest: dest.clone(),
+                    uri: String::new(),
+                    when,
+                });
+                self.completed_downloads.set(self.completed_downloads.get() + 1);
+                self.flash_download_pill(&format!("✓ {name} saved"));
+            }
+        }
+        self.refresh_download_ui();
+    }
+
+    /// Download failed (or was cancelled) → drop from tracking.
+    fn fail_download(&self, id: u64) {
+        // Don't leave a "Save Download" dialog on screen for a download that
+        // no longer exists — answering it would hit a freed WebKitDownload.
+        self.close_save_dialog(id);
+        let pos = self.downloads.borrow_mut().iter().position(|d| d.id == id);
+        let removed = pos.map(|pos| {
+            let d = self.downloads.borrow_mut().remove(pos);
+            unsafe { ffi::g_object_unref(d.download as *mut ffi::GObject) };
+            d.name.clone()
+        });
+        if let Some(name) = removed {
+            self.flash_download_pill(&format!("✗ {name} failed"));
+        }
+        self.refresh_download_ui();
+    }
+
+    fn download_filename_from_uri(uri: &str) -> String {
+        let tail = uri.rsplit('/').next().unwrap_or("download");
+        let cleaned: String = tail
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("download")
+            .to_string();
+        if cleaned.is_empty() {
+            "download".to_string()
+        } else {
+            cleaned
+        }
+    }
+
+    /// Poll download progress to drive the live pill/popover/page. Completion
+    /// itself is event-driven via finished/failed signals.
+    fn poll_download(&self, id: u64) {
+        let me_weak = self.self_weak.clone();
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(400), move || {
+            let Some(me) = me_weak.upgrade() else {
+                return gtk4::glib::ControlFlow::Break;
+            };
+            if !me.downloads.borrow().iter().any(|d| d.id == id) {
+                return gtk4::glib::ControlFlow::Break;
+            }
+            me.refresh_download_ui();
+            gtk4::glib::ControlFlow::Continue
+        });
     }
 
     fn close_current_tab(&self) {
@@ -1346,6 +2971,7 @@ impl BrowserWindow {
             drop(tabs);
             self.activate_tab(new_tab);
         }
+        self.save_session();
     }
 }
 
@@ -2023,6 +3649,105 @@ impl BrowserWindow {
         gen_group.append(&row_search);
 
         gen_page.append(&gen_group);
+
+        // ── General → Downloads ──────────────────────────────────────────
+        let dl_sec_label = Label::new(Some("Downloads"));
+        dl_sec_label.set_css_classes(&["settings-group-header"]);
+        dl_sec_label.set_xalign(0.0);
+        gen_page.append(&dl_sec_label);
+
+        let dl_group = GtkBox::new(Orientation::Vertical, 0);
+        dl_group.set_css_classes(&["settings-group-card"]);
+
+        // Folder row
+        let row_dl_dir = GtkBox::new(Orientation::Horizontal, 12);
+        row_dl_dir.set_css_classes(&["settings-group-row"]);
+        let dl_info = GtkBox::new(Orientation::Vertical, 2);
+        dl_info.set_hexpand(true);
+        let dl_title = Label::new(Some("Download folder"));
+        dl_title.set_css_classes(&["settings-row-title"]);
+        dl_title.set_xalign(0.0);
+        let dl_dir_display = gtk4::Label::new(None);
+        let dl_dir_display_clone = dl_dir_display.clone();
+        dl_dir_display.set_css_classes(&["settings-row-subtitle"]);
+        dl_dir_display.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+        dl_dir_display.set_xalign(0.0);
+        dl_info.append(&dl_title);
+        dl_info.append(&dl_dir_display_clone);
+
+        let dl_dir_btn = Button::with_label("Change…");
+        dl_dir_btn.set_css_classes(&["settings-dropdown-btn"]);
+        dl_dir_btn.set_valign(gtk4::Align::Center);
+        let me_weak = self.self_weak.clone();
+        let win = self.window.clone();
+        let dl_dir_label2 = dl_dir_display.clone();
+        dl_dir_btn.connect_clicked(move |_| {
+            if let Some(me) = me_weak.upgrade() {
+                let dialog = gtk4::FileChooserNative::builder()
+                    .title("Choose Download Folder")
+                    .action(gtk4::FileChooserAction::SelectFolder)
+                    .transient_for(&win)
+                    .modal(true)
+                    .build();
+                let (tx, rx) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+                let loop_ = gtk4::glib::MainLoop::new(None, false);
+                let loop_quit = loop_.clone();
+                dialog.connect_response(move |d, resp| {
+                    let result = if resp == gtk4::ResponseType::Accept {
+                        d.file().and_then(|f| f.path())
+                    } else {
+                        None
+                    };
+                    let _ = tx.send(result);
+                    loop_quit.quit();
+                });
+                dialog.show();
+                loop_.run();
+                if let Ok(Some(dir)) = rx.try_recv() {
+                    me.set_download_dir(dir.to_string_lossy().as_ref());
+                    dl_dir_label2.set_text(&dir.to_string_lossy());
+                }
+            }
+        });
+        // Show current folder (setting or default).
+        {
+            let cur = self.effective_download_dir();
+            dl_dir_display.set_text(&cur.to_string_lossy());
+        }
+        row_dl_dir.append(&dl_info);
+        row_dl_dir.append(&dl_dir_btn);
+        dl_group.append(&row_dl_dir);
+
+        dl_group.append(&gtk4::Separator::new(Orientation::Horizontal));
+
+        // Ask-every-time row
+        let row_dl_ask = GtkBox::new(Orientation::Horizontal, 12);
+        row_dl_ask.set_css_classes(&["settings-group-row"]);
+        let dl_ask_info = GtkBox::new(Orientation::Vertical, 2);
+        dl_ask_info.set_hexpand(true);
+        let dl_ask_title = Label::new(Some("Ask where to save each download"));
+        dl_ask_title.set_css_classes(&["settings-row-title"]);
+        dl_ask_title.set_xalign(0.0);
+        let dl_ask_sub = Label::new(Some("Show the file picker for every download"));
+        dl_ask_sub.set_css_classes(&["settings-row-subtitle"]);
+        dl_ask_sub.set_xalign(0.0);
+        dl_ask_info.append(&dl_ask_title);
+        dl_ask_info.append(&dl_ask_sub);
+        let dl_ask_switch = gtk4::Switch::new();
+        dl_ask_switch.set_active(self.settings.borrow().ask_download_location);
+        dl_ask_switch.set_valign(gtk4::Align::Center);
+        let me_weak = self.self_weak.clone();
+        dl_ask_switch.connect_state_set(move |_, state| {
+            if let Some(me) = me_weak.upgrade() {
+                me.set_ask_download_location(state);
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+        row_dl_ask.append(&dl_ask_info);
+        row_dl_ask.append(&dl_ask_switch);
+        dl_group.append(&row_dl_ask);
+
+        gen_page.append(&dl_group);
         content_stack.add_named(&gen_page, Some("general"));
 
         // ── Privacy Page ─────────────────────────────────────────────────────

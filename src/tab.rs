@@ -19,6 +19,10 @@ pub enum TabEvent {
     LoadFailed { uri: String, message: String },
     PinnedChanged(bool),
     FaviconReady(FaviconData),
+    /// A `target=_blank` link / window.open on this tab wants `uri` opened.
+    NewWindowRequested(String),
+    /// WebKit asked the webview to go into/out of fullscreen (video player).
+    FullscreenChanged(bool),
 }
 
 /// Raw RGBA favicon pixels for a tab.
@@ -182,6 +186,71 @@ impl Tab {
                 rgba: fav.rgba,
             }));
         });
+
+        // target=_blank / window.open: surface as an event so the window can
+        // open a real tab. Script popups (no user gesture) are suppressed
+        // inside webview.rs by our popup blocker.
+        let me_weak4: Weak<Self> = Rc::downgrade(self);
+        self.webview.connect_create(move |uri| {
+            let Some(me) = me_weak4.upgrade() else { return };
+            me.emit(TabEvent::NewWindowRequested(uri));
+        });
+
+        // Video player fullscreen requests.
+        let me_weak5: Weak<Self> = Rc::downgrade(self);
+        self.webview.connect_fullscreen_mode(move |active| {
+            let Some(me) = me_weak5.upgrade() else { return };
+            me.emit(TabEvent::FullscreenChanged(active));
+        });
+        // NOTE: downloads are wired at the network-session level in window.rs —
+        // `download-started` is not a WebKitWebView signal in the GTK4 API.
+    }
+
+    // ── Zoom ────────────────────────────────────────────────────────────────
+
+    const ZOOM_STEP: f64 = 1.1;
+    const ZOOM_MIN: f64 = 0.3;
+    const ZOOM_MAX: f64 = 5.0;
+
+    pub fn zoom_in(&self) {
+        let z = (self.webview.zoom_level() * Self::ZOOM_STEP).min(Self::ZOOM_MAX);
+        self.webview.set_zoom_level(z);
+    }
+
+    pub fn zoom_out(&self) {
+        let z = (self.webview.zoom_level() / Self::ZOOM_STEP).max(Self::ZOOM_MIN);
+        self.webview.set_zoom_level(z);
+    }
+
+    pub fn zoom_reset(&self) {
+        self.webview.set_zoom_level(1.0);
+    }
+
+    // ── Find in page ────────────────────────────────────────────────────────
+
+    pub fn find(&self, text: &str, forward: bool) {
+        self.webview.find_search(text, forward);
+    }
+
+    pub fn find_next(&self, text: &str) {
+        self.webview.find_next();
+        let _ = text;
+    }
+
+    pub fn find_prev(&self, text: &str) {
+        self.webview.find_prev();
+        let _ = text;
+    }
+
+    pub fn find_done(&self) {
+        self.webview.find_finish();
+    }
+
+    /// Current URL for session persistence.
+    pub fn session_uri(&self) -> String {
+        self.webview
+            .uri()
+            .unwrap_or_else(|| self.url.borrow().clone())
     }
 
     pub fn load_new_tab_page(&self, dark: bool) {

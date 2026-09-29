@@ -31,7 +31,8 @@ pub fn run() -> glib::ExitCode {
         let bw = BrowserWindow::new(app);
         // Window must be presented before WebViews load HTML so they are realized.
         bw.window.present();
-        bw.add_tab(true);
+        // restore_session() in the constructor opens the saved tabs, or one
+        // new tab when there is nothing to restore.
         // Leak the Rc so that the BrowserWindow (and its Tabs) outlive the
         // activate closure. The single window lives for the entire app lifetime.
         std::mem::forget(bw);
