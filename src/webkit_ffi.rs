@@ -10,6 +10,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_void};
 
 pub type WebKitWebView = c_void;
 pub type WebKitSettings = c_void;
+pub type WebKitDownload = c_void;
 pub type GObject = c_void;
 pub type GtkWidget = c_void;
 
@@ -184,4 +185,71 @@ extern "C" {
     pub fn webkit_web_view_get_network_session(web_view: *mut WebKitWebView) -> *mut c_void;
     pub fn webkit_network_session_get_website_data_manager(session: *mut c_void) -> *mut c_void;
     pub fn webkit_website_data_manager_set_favicons_enabled(manager: *mut c_void, enabled: c_int);
+
+    // ----- Navigation policy (adblock-rust engine integration) -----
+    pub fn webkit_web_view_get_main_resource(web_view: *mut WebKitWebView) -> *mut c_void;
+    pub fn webkit_uri_request_get_uri(request: *mut c_void) -> *const c_char;
+    pub fn webkit_response_policy_decision_get_request(decision: *mut c_void) -> *mut c_void;
+    pub fn webkit_navigation_policy_decision_get_navigation_action(decision: *mut c_void)
+        -> *mut c_void;
+    pub fn webkit_navigation_action_get_request(action: *mut c_void) -> *mut c_void;
+    pub fn webkit_navigation_action_get_navigation_type(action: *mut c_void) -> c_uint;
+    pub fn webkit_navigation_action_is_user_gesture(action: *mut c_void) -> i32;
+    pub fn webkit_policy_decision_ignore(decision: *mut c_void);
+    pub fn webkit_policy_decision_use(decision: *mut c_void);
+    pub fn webkit_policy_decision_download(decision: *mut c_void);
+
+    // Response policy (GTK4 has no webkit_response_policy_decision_is_download;
+    // "should download" == the MIME type is not renderable in the view).
+    pub fn webkit_response_policy_decision_get_response(decision: *mut c_void) -> *mut c_void;
+    pub fn webkit_response_policy_decision_is_mime_type_supported(decision: *mut c_void) -> i32;
+    pub fn webkit_uri_response_get_mime_type(response: *mut c_void) -> *const c_char;
+
+    // ----- Downloads -----
+    pub fn webkit_download_get_destination(download: *mut c_void) -> *const c_char;
+    pub fn webkit_download_set_destination(download: *mut c_void, destination: *const c_char);
+    pub fn webkit_download_get_received_data_length(download: *mut c_void) -> u64;
+    pub fn webkit_download_get_estimated_progress(download: *mut c_void) -> f64;
+    pub fn webkit_download_get_response(download: *mut c_void) -> *mut c_void;
+    pub fn webkit_download_cancel(download: *mut c_void);
+    pub fn webkit_uri_response_get_uri(response: *mut c_void) -> *const c_char;
+    pub fn webkit_uri_response_get_suggested_filename(response: *mut c_void) -> *const c_char;
+    pub fn webkit_uri_response_get_content_length(response: *mut c_void) -> u64;
+
+    // ----- Find in page (WebKitFindController) -----
+    pub fn webkit_web_view_get_find_controller(web_view: *mut WebKitWebView) -> *mut c_void;
+    pub fn webkit_find_controller_search(
+        controller: *mut c_void,
+        search_text: *const c_char,
+        find_options: c_uint,
+        max_matches: c_uint,
+    );
+    pub fn webkit_find_controller_search_finish(controller: *mut c_void);
+    pub fn webkit_find_controller_search_next(controller: *mut c_void);
+    pub fn webkit_find_controller_search_previous(controller: *mut c_void);
+
+    // ----- Zoom -----
+    pub fn webkit_web_view_set_zoom_level(web_view: *mut WebKitWebView, zoom_level: f64);
+    pub fn webkit_web_view_get_zoom_level(web_view: *mut WebKitWebView) -> f64;
+
+    // ----- Fullscreen (video) -----
+    pub fn gtk_window_fullscreen(window: *mut c_void);
+    pub fn gtk_window_unfullscreen(window: *mut c_void);
 }
+
+/// WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE (value 1); 0 = default options.
+pub const FIND_OPTIONS_NONE: c_uint = 0;
+pub const FIND_OPTIONS_CASE_INSENSITIVE: c_uint = 1;
+/// WEBKIT_FIND_OPTIONS_WRAP_AROUND (value 4).
+pub const FIND_OPTIONS_WRAP_AROUND: c_uint = 4;
+/// Max matches reported by the find controller.
+pub const FIND_MAX_MATCHES: c_uint = 500;
+
+/// WEBKIT_NAVIGATION_TYPE_OTHER — navigations opened by scripts, i.e. popups.
+pub const NAVIGATION_TYPE_OTHER: c_uint = 5;
+
+/// WEBKIT_POLICY_DECISION_TYPE_* from WebKitWebView.h (enum values are 0-based).
+/// `decide-policy` delivers these as guint.
+pub const POLICY_DECISION_TYPE_NAVIGATION_ACTION: c_uint = 0;
+pub const POLICY_DECISION_TYPE_NEW_WINDOW_ACTION: c_uint = 1;
+pub const POLICY_DECISION_TYPE_RESPONSE: c_uint = 2;
