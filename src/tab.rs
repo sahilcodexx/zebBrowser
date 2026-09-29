@@ -139,21 +139,45 @@ impl Tab {
             // Benign failures: navigation policy changes and cancellations
             // (including cancellation caused by our own error-page render).
             // Rendering an error page for these causes an infinite loop.
-            const G_IO_ERROR: u32 = 39;
+            //
+            // The domain is a GQuark, so it must come from the quark functions
+            // at runtime — the values are derived from the quark strings, not
+            // small integers, and hardcoding them meant nothing ever matched
+            // and every interrupted frame showed an error page.
             const G_IO_ERROR_CANCELLED: i32 = 19;
-            const WEBKIT_POLICY_ERROR: u32 = 2;
-            const WEBKIT_NETWORK_ERROR: u32 = 5;
-            const WEBKIT_PLUGIN_ERROR: u32 = 6;
-            if domain == G_IO_ERROR && code == G_IO_ERROR_CANCELLED {
+            const WEBKIT_NETWORK_ERROR_CANCELLED: i32 = 3;
+            const WEBKIT_POLICY_ERROR: i32 = 2; // POLICY_ERROR_FAILED_ACTION
+            const WEBKIT_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE: i32 = 101;
+            const WEBKIT_POLICY_USER_CANCELLED: i32 = 102;
+            const WEBKIT_POLICY_PLUGIN_FAILED: i32 = 103;
+
+            let (g_io, wk_net, wk_policy) = unsafe {
+                (
+                    ffi::g_io_error_quark(),
+                    ffi::webkit_network_error_quark(),
+                    ffi::webkit_policy_error_quark(),
+                )
+            };
+
+            if domain == g_io && code == G_IO_ERROR_CANCELLED {
                 return true; // G_IO_ERROR_CANCELLED ("Operation was cancelled")
             }
-            if domain == WEBKIT_NETWORK_ERROR && code == 3 {
+            if domain == wk_net && code == WEBKIT_NETWORK_ERROR_CANCELLED {
                 return true; // WEBKIT_NETWORK_ERROR_CANCELLED
             }
-            if domain == WEBKIT_POLICY_ERROR && code == 101 {
-                return true; // FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE
-            }
-            if domain == WEBKIT_PLUGIN_ERROR {
+            // A navigation that turns into a download is reported as the frame
+            // load being interrupted (WebKit reuses the "Frame load
+            // interrupted" message for USER_CANCELLED, code 102) — expected
+            // here, so it must never turn into an error page.
+            if domain == wk_policy
+                && matches!(
+                    code,
+                    WEBKIT_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE
+                        | WEBKIT_POLICY_USER_CANCELLED
+                        | WEBKIT_POLICY_PLUGIN_FAILED
+                        | WEBKIT_POLICY_ERROR
+                )
+            {
                 return true;
             }
             // Last-resort guard: any transient cancellation (whatever domain
