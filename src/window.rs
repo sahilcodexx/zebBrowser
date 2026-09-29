@@ -1158,6 +1158,7 @@ impl BrowserWindow {
         menu.append_section(None, &settings);
 
         let popover = PopoverMenu::from_model(Some(&menu));
+        self.theme_popover(popover.upcast_ref::<gtk4::Popover>());
         popover.set_parent(&self.browser_menu_btn);
         popover.set_has_arrow(false);
         popover.popup();
@@ -1213,6 +1214,20 @@ impl BrowserWindow {
         } else {
             self.window.remove_css_class("dark");
             self.window.add_css_class("light");
+        }
+
+        // Set GTK's own dark preference too, not just our CSS class. Surfaces
+        // that are not descendants of the main window — the save dialog, the
+        // pin/context menus, the downloads popover — otherwise fall back to
+        // GTK's light defaults, which is what made the "Save Download" dialog
+        // come up half-light with a dark sidebar on a dark browser.
+        if let Some(gtk_settings) = gtk4::Settings::default() {
+            gtk_settings.set_gtk_application_prefer_dark_theme(is_dark);
+        }
+
+        // Popovers live on their own surfaces, so re-tag any that are open.
+        if let Some(pop) = self.downloads_popover.borrow().as_ref() {
+            self.theme_popover(pop);
         }
 
         // Live update any open new tab pages with updated theme via JS (instant, zero reload)
@@ -3159,6 +3174,7 @@ impl BrowserWindow {
         menu.append(Some("Close Tab"), Some("win.close"));
 
         let popover = PopoverMenu::from_model(Some(&menu));
+        self.theme_popover(popover.upcast_ref::<gtk4::Popover>());
         popover.set_parent(
             &gesture
                 .widget()
@@ -5161,6 +5177,371 @@ fn install_css() {
         .settings-group-card.dark separator {
             background-color: #30303b;
             border: 0;
+        }
+
+        /* ── Sidebar nav row ────────────────────────────────────────── */
+        .sidebar-nav {
+            margin: 0 6px 0 0;
+        }
+        .sidebar-nav button {
+            min-height: 30px;
+            padding: 4px;
+            border: 0;
+            border-radius: 7px;
+            color: #64748b;
+            background: transparent;
+            background-image: none;
+            box-shadow: none;
+        }
+        .sidebar-nav button:hover {
+            color: #1c1c1e;
+            background: rgba(0,0,0,0.07);
+        }
+        window.dark .sidebar-nav button {
+            color: #929aab;
+        }
+        window.dark .sidebar-nav button:hover {
+            color: #f4f4f7;
+            background: rgba(255,255,255,0.07);
+        }
+
+        /* ── Downloads popover ─────────────────────────────────────── */
+        .downloads-popover {
+            padding: 6px 2px 8px;
+        }
+        .downloads-header {
+            font-weight: 700;
+            font-size: 12.5px;
+            padding: 4px 12px 6px;
+            color: #1e293b;
+        }
+        window.dark .downloads-header {
+            color: #f4f4f7;
+        }
+        .downloads-row-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #1e293b;
+        }
+        .downloads-row-sub {
+            font-size: 11.5px;
+            font-weight: 500;
+            color: #64748b;
+        }
+        window.dark .downloads-row-title { color: #f4f4f7; }
+        window.dark .downloads-row-sub { color: #929aab; }
+        .downloads-empty {
+            color: #64748b;
+            font-size: 12px;
+        }
+        .downloads-cancel-btn {
+            min-width: 26px;
+            min-height: 26px;
+            padding: 3px;
+            border: 0;
+            border-radius: 8px;
+            background-color: transparent;
+            background-image: none;
+            box-shadow: none;
+            color: #64748b;
+        }
+        .downloads-cancel-btn:hover {
+            color: #0f172a;
+            background-color: rgba(0, 0, 0, 0.07);
+        }
+        window.dark .downloads-cancel-btn {
+            color: #a6adbd;
+        }
+        window.dark .downloads-cancel-btn:hover {
+            color: #ffffff;
+            background-color: rgba(255, 255, 255, 0.10);
+        }
+        .downloads-open-dir {
+            margin: 6px 10px 0;
+            min-height: 30px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        /* ── Full-page downloads view ───────────────────────────────── */
+        .downloads-page-backdrop {
+            background: rgba(15, 18, 25, 0.55);
+        }
+        .downloads-page-card {
+            background: #ffffff;
+            border-radius: 14px;
+            padding: 20px 24px;
+        }
+        window.dark .downloads-page-card {
+            background: #1b1b22;
+        }
+        .downloads-page-title {
+            font-size: 20px;
+            font-weight: 800;
+            color: #1e293b;
+        }
+        window.dark .downloads-page-title { color: #f4f4f7; }
+        .downloads-page-toolbar {
+            margin: 12px 0 6px;
+        }
+        .downloads-page-search {
+            min-height: 34px;
+            padding: 0 12px;
+            border-radius: 10px;
+            font-size: 12.5px;
+            font-weight: 500;
+            color: #202124;
+            background-color: rgba(118, 118, 128, 0.10);
+            background-image: none;
+            border: 1px solid rgba(60, 60, 67, 0.10);
+            box-shadow: none;
+            caret-color: #202124;
+        }
+        .downloads-page-search:hover {
+            background-color: rgba(118, 118, 128, 0.15);
+        }
+        .downloads-page-search:focus {
+            background-color: #ffffff;
+            border-color: rgba(0, 122, 255, 0.55);
+            box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.12);
+            outline: none;
+        }
+        .downloads-page-search text,
+        .downloads-page-search > text {
+            background: transparent;
+            background-image: none;
+            color: #202124;
+            box-shadow: none;
+        }
+        window.dark .downloads-page-search {
+            color: #e6e6eb;
+            background-color: rgba(255, 255, 255, 0.07);
+            border-color: rgba(255, 255, 255, 0.09);
+            caret-color: #e6e6eb;
+        }
+        window.dark .downloads-page-search:hover {
+            background-color: rgba(255, 255, 255, 0.10);
+        }
+        window.dark .downloads-page-search:focus {
+            background-color: rgba(255, 255, 255, 0.12);
+            border-color: rgba(122, 168, 255, 0.55);
+            box-shadow: 0 0 0 3px rgba(122, 168, 255, 0.16);
+        }
+        window.dark .downloads-page-search text,
+        window.dark .downloads-page-search > text {
+            color: #e6e6eb;
+        }
+        .downloads-page-toolbar > button {
+            min-height: 34px;
+            padding: 0 14px;
+            border-radius: 10px;
+            font-size: 12.5px;
+            font-weight: 600;
+            color: #475569;
+            background-color: rgba(118, 118, 128, 0.10);
+            background-image: none;
+            border: 1px solid rgba(60, 60, 67, 0.10);
+            box-shadow: none;
+        }
+        .downloads-page-toolbar > button:hover {
+            color: #0f172a;
+            background-color: rgba(220, 38, 38, 0.10);
+            border-color: rgba(220, 38, 38, 0.25);
+        }
+        window.dark .downloads-page-toolbar > button {
+            color: #a6adbd;
+            background-color: rgba(255, 255, 255, 0.07);
+            border-color: rgba(255, 255, 255, 0.09);
+        }
+        window.dark .downloads-page-toolbar > button:hover {
+            color: #fca5a5;
+            background-color: rgba(239, 68, 68, 0.16);
+            border-color: rgba(239, 68, 68, 0.28);
+        }
+        .downloads-section-label {
+            font-size: 12px;
+            font-weight: 700;
+            color: #64748b;
+        }
+        window.dark .downloads-section-label { color: #929aab; }
+        .downloads-page-row {
+            padding: 8px 10px;
+            border-radius: 10px;
+        }
+        .downloads-page-row:hover {
+            background: rgba(0, 0, 0, 0.045);
+        }
+        window.dark .downloads-page-row:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .downloads-file-icon {
+            color: #2563eb;
+            min-width: 20px;
+        }
+        .downloads-progress {
+            min-width: 140px;
+        }
+
+        /* ── Download card / toast (bottom-right) ─────────────────────────
+           The widget is added to the main overlay, i.e. on top of the web
+           page. Without an opaque background the filename and percentage
+           were bare text floating over page content. */
+        .download-pill,
+        .download-toast {
+            /* GTK4 CSS has no max-width; a fixed width plus ellipsized labels
+               is what keeps the card from stretching across the window. */
+            min-width: 300px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background-color: rgba(255, 255, 255, 0.98);
+            background-image: none;
+            border: 1px solid rgba(60, 60, 67, 0.10);
+            box-shadow: 0 12px 32px rgba(15, 23, 42, 0.18);
+            color: #1e293b;
+        }
+        .download-pill {
+            padding-bottom: 14px;
+        }
+        .download-toast {
+            min-width: 0;
+            padding: 10px 14px;
+        }
+        window.dark .download-pill,
+        window.dark .download-toast {
+            background-color: rgba(32, 32, 41, 0.98);
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            box-shadow: 0 14px 38px rgba(0, 0, 0, 0.55);
+            color: #e6e6eb;
+        }
+        .download-pill-icon {
+            color: #2563eb;
+            opacity: 0.9;
+        }
+        window.dark .download-pill-icon {
+            color: #7aa8ff;
+        }
+        .download-pill-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #1e293b;
+        }
+        window.dark .download-pill-title {
+            color: #f4f4f7;
+        }
+        .download-pill-meta,
+        .download-toast-text {
+            font-size: 11.5px;
+            font-weight: 500;
+            color: #64748b;
+        }
+        window.dark .download-pill-meta,
+        window.dark .download-toast-text {
+            color: #929aab;
+        }
+        .download-pill-cancel {
+            min-width: 24px;
+            min-height: 24px;
+            padding: 2px;
+            border: 0;
+            border-radius: 8px;
+            background-color: transparent;
+            background-image: none;
+            box-shadow: none;
+            color: #64748b;
+        }
+        .download-pill-cancel:hover {
+            color: #dc2626;
+            background-color: rgba(220, 38, 38, 0.10);
+        }
+        window.dark .download-pill-cancel {
+            color: #8b94a7;
+        }
+        window.dark .download-pill-cancel:hover {
+            color: #fca5a5;
+            background-color: rgba(239, 68, 68, 0.16);
+        }
+        .download-pill-bar {
+            min-height: 5px;
+            border-radius: 999px;
+            background-color: rgba(118, 118, 128, 0.22);
+            border: 0;
+            box-shadow: none;
+        }
+        .download-pill-bar trough,
+        .download-pill-bar > trough {
+            min-height: 5px;
+            border-radius: 999px;
+            background-color: rgba(118, 118, 128, 0.22);
+            border: 0;
+        }
+        .download-pill-bar progress {
+            min-height: 5px;
+            border-radius: 999px;
+            background-color: #2563eb;
+            border: 0;
+        }
+        window.dark .download-pill-bar,
+        window.dark .download-pill-bar > trough {
+            background-color: rgba(255, 255, 255, 0.14);
+        }
+        window.dark .download-pill-bar progress {
+            background-color: #4d8bff;
+        }
+
+        /* ── Popovers & menus ────────────────────────────────────────────
+           Popovers are separate toplevel surfaces, so they never inherit
+           the `dark` class we set on the main window. Each popover gets the
+           class set explicitly (see theme_popover) and is themed here —
+           otherwise menus render as pale GTK-default boxes with low-contrast
+           text on top of the dark UI. */
+        popover {
+            background: transparent;
+            box-shadow: none;
+        }
+        popover > contents {
+            padding: 6px;
+            border-radius: 12px;
+            background-color: #ffffff;
+            border: 1px solid rgba(60, 60, 67, 0.10);
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.16);
+        }
+        popover.dark > contents {
+            background-color: #202029;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            box-shadow: 0 14px 34px rgba(0, 0, 0, 0.55);
+        }
+        popover modelbutton {
+            min-height: 30px;
+            padding: 4px 12px;
+            border-radius: 8px;
+            font-size: 12.5px;
+            font-weight: 600;
+            color: #1e293b;
+            background-color: transparent;
+            background-image: none;
+            border: 0;
+            box-shadow: none;
+        }
+        popover modelbutton:hover,
+        popover modelbutton:focus {
+            color: #0f172a;
+            background-color: rgba(118, 118, 128, 0.16);
+        }
+        popover.dark modelbutton {
+            color: #e6e6eb;
+        }
+        popover.dark modelbutton:hover,
+        popover.dark modelbutton:focus {
+            color: #ffffff;
+            background-color: rgba(255, 255, 255, 0.10);
+        }
+        popover separator {
+            margin: 5px 10px;
+            background-color: rgba(60, 60, 67, 0.12);
+            min-height: 1px;
+        }
+        popover.dark separator {
+            background-color: rgba(255, 255, 255, 0.10);
         }
         "#,
     );
